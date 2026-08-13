@@ -1127,12 +1127,6 @@ mod _async_tasks {
             Ok(JSValue::js_boolean(self))
         }
     }
-    impl FsReturn for Null {
-        #[inline]
-        fn fs_to_js(self, _global: &JSGlobalObject) -> JsResult<JSValue> {
-            Ok(JSValue::NULL)
-        }
-    }
     impl FsReturn for Stats {
         #[inline]
         fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
@@ -4269,9 +4263,6 @@ impl StringOrUndefined {
         }
     }
 }
-
-/// For use in `Return`'s definitions to act as `void` while returning `null` to JavaScript
-pub struct Null;
 
 pub mod ret {
     use super::*;
