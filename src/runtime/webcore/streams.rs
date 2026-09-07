@@ -903,9 +903,7 @@ impl SourceHandle {
                     Some(err) => err.to_js(global),
                     None => JSValue::UNDEFINED,
                 };
-                crate::dispatch::fold(::bun_jsc::call_check_slow(global, || {
-                    controller_abi::on_close(cpp, reason)
-                }));
+                Self::close_js_controller(global, cpp, reason);
             }
             SourceHandle::ByteStream(p) => p.on_close(err),
             SourceHandle::FileReader(p) => p.on_close(err),
@@ -918,6 +916,27 @@ impl SourceHandle {
             SourceHandle::HTMLRewriter(p) => p.on_close(err),
             SourceHandle::TestingCancelOnDrain(_) => {}
         }
+    }
+
+    /// [`close`](Self::close) for a consumer that went away: a piped JS
+    /// ReadableStream's cancel() receives the abort reason instead of `undefined`.
+    pub fn abort(&mut self, reason: CommonAbortReason) {
+        match *self {
+            SourceHandle::JSController(cpp) => {
+                let global = VirtualMachine::get().global();
+                if global.has_exception() {
+                    return;
+                }
+                Self::close_js_controller(global, cpp, reason.to_js(global));
+            }
+            _ => self.close(None),
+        }
+    }
+
+    fn close_js_controller(global: &JSGlobalObject, cpp: JSValue, reason: JSValue) {
+        crate::dispatch::fold(::bun_jsc::call_check_slow(global, || {
+            controller_abi::on_close(cpp, reason)
+        }));
     }
 
     pub fn ready(&mut self, _amount: Option<BlobSizeType>, _offset: Option<BlobSizeType>) {
@@ -1764,19 +1783,32 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
         self.unregister_auto_flusher();
     }
 
-    /// In this case, it's always an error
-    pub(crate) fn end(&mut self, err: Option<SysError>) -> bun_sys::Result<()> {
-        bun_core::scoped_log!(HTTPServerWritableLog, "end({:?})", err);
+    /// `controller.close()` with no error: the same clean end as `controller.end()`.
+    /// If `try_end` hits backpressure the parked `pending_flush` is what the
+    /// owning `RequestContext` waits on before it releases the sink.
+    pub(crate) fn end(&mut self, _err: Option<SysError>) -> bun_sys::Result<()> {
+        let global_this = self
+            .global_this
+            .expect("HTTPServerWritable.global_this used before init");
+        self.end_from_js(&global_this).map(|_| ())
+    }
+
+    /// The source failed: `controller.close(error)`, or the pump closing the sink
+    /// for an errored stream. Stop accepting writes and send nothing more. The
+    /// buffered tail is dropped so the owning `RequestContext` can truncate the
+    /// response when the pump promise rejects, instead of ending it cleanly.
+    pub(crate) fn fail(&mut self) {
+        bun_core::scoped_log!(HTTPServerWritableLog, "fail()");
 
         if self.requested_end {
-            return bun_sys::Result::Ok(());
+            return;
         }
 
         if self.is_done() || self.res.is_none() || self.any_res().unwrap().has_responded() {
-            self.source.close(err);
+            self.source.close(None);
             self.mark_done();
             self.finalize();
-            return bun_sys::Result::Ok(());
+            return;
         }
 
         self.requested_end = true;
@@ -1784,14 +1816,10 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
         self.end_len = readable_len;
 
         if readable_len == 0 {
-            self.source.close(err);
+            self.source.close(None);
             self.mark_done();
-            // we do not close the stream here
-            // this.res.endStream(false);
             self.finalize();
-            return bun_sys::Result::Ok(());
         }
-        bun_sys::Result::Ok(())
     }
 
     pub(crate) fn end_from_js(&mut self, global_this: &JSGlobalObject) -> bun_sys::Result<JSValue> {
@@ -1869,7 +1897,7 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
         // no reference into the allocation may be live across the call.
         // SAFETY: as above; `source` is copied out before the close.
         let mut source = unsafe { (*this).source };
-        source.close(None);
+        source.abort(CommonAbortReason::ConnectionClosed);
     }
 
     fn unregister_auto_flusher(&mut self) {
@@ -2073,6 +2101,15 @@ impl<const SSL: bool> crate::webcore::sink::JsSinkType for HTTPServerWritable<SS
         // `destroy` frees it (never the inherent `finalize`), so the `&mut`
         // scoped to this call stays valid throughout.
         unsafe { (*this).finalize() }
+    }
+    unsafe fn close_with_error(
+        this: *mut Self,
+        _global: &JSGlobalObject,
+        _reason: JSValue,
+    ) -> bun_sys::Result<()> {
+        // SAFETY: caller contract; `fail` does not free the sink.
+        unsafe { (*this).fail() };
+        bun_sys::Result::Ok(())
     }
     fn end_from_js(&mut self, global: &JSGlobalObject) -> bun_sys::Result<JSValue> {
         Self::end_from_js(self, global)

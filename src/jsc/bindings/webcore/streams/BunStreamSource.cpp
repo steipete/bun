@@ -746,8 +746,11 @@ static void nativeSourcePullRejected(JSC::VM& vm, JSGlobalObject* globalObject, 
 
 // readDirectStreamOnClose. The state-mutation half runs only when a stream is provided; everything
 // that can throw (the sink's end(), the user's cancel(reason)) runs after the state is final, and a
-// throw from it propagates to whoever closed.
-static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject, JSDirectSinkCloseState* state, JSValue streamValue, JSValue reason)
+// throw from it propagates to whoever closed. `sinkClosed` is the JSSink onClose protocol's third
+// argument: true only when the native sink closed underneath a still-attached source (peer abort,
+// destination closed, write error). The source's own end()/close(), a settled pull, and a missing
+// pull all finish the stream without the consumer going away, so they do not cancel() the source.
+static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject, JSDirectSinkCloseState* state, JSValue streamValue, JSValue reason, bool sinkClosed)
 {
     auto scope = DECLARE_THROW_SCOPE(vm);
     JSObject* sinkController = state->m_sinkController.get();
@@ -783,7 +786,7 @@ static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject,
         invokeMethod(vm, globalObject, sinkController, builtinNames(vm).endPublicName(), noArgs);
         RETURN_IF_EXCEPTION(scope, );
     }
-    if (underlyingSource) {
+    if (underlyingSource && sinkClosed) {
         JSValue cancelFunction = underlyingSource->get(globalObject, builtinNames(vm).cancelPublicName());
         RETURN_IF_EXCEPTION(scope, );
         if (cancelFunction.isCallable()) {
@@ -817,12 +820,12 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
     bool pullIsTruthy = pull.toBoolean(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
     if (!pullIsTruthy) {
-        readDirectStreamCloseImpl(vm, globalObject, state, jsUndefined(), jsUndefined());
+        readDirectStreamCloseImpl(vm, globalObject, state, jsUndefined(), jsUndefined(), false);
         RETURN_IF_EXCEPTION(scope, {});
         return jsUndefined();
     }
     if (!pull.isCallable()) {
-        readDirectStreamCloseImpl(vm, globalObject, state, jsUndefined(), jsUndefined());
+        readDirectStreamCloseImpl(vm, globalObject, state, jsUndefined(), jsUndefined(), false);
         RETURN_IF_EXCEPTION(scope, {});
         throwTypeError(globalObject, scope, "pull is not a function"_s);
         return {};
@@ -1413,7 +1416,8 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundReadDirectStreamOnClose, (JSGl
     auto& vm = getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto* state = uncheckedDowncast<JSDirectSinkCloseState>(callFrame->argument(0));
-    Bun::WebStreams::readDirectStreamCloseImpl(vm, globalObject, state, callFrame->argument(1), callFrame->argument(2));
+    bool sinkClosed = callFrame->argument(3).isTrue();
+    Bun::WebStreams::readDirectStreamCloseImpl(vm, globalObject, state, callFrame->argument(1), callFrame->argument(2), sinkClosed);
     RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(jsUndefined());
 }
