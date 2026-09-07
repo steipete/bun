@@ -334,6 +334,58 @@ describe("spawn stdin ReadableStream", () => {
     expect(exitCode).toBe(0);
   });
 
+  // The child is already running when stdin is wired up, so an exception
+  // escaping spawn() here would lose the Subprocess handle (nothing to kill or
+  // await). A synchronous throw from a direct stream's pull() is that pull's
+  // rejection: the bytes it flushed are delivered, stdin is closed, and the
+  // child sees EOF, the same as `async pull() { throw }`.
+  test("a direct ReadableStream whose pull() throws synchronously does not throw out of spawn()", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        let uncaught = 0;
+        process.on("unhandledRejection", () => { uncaught++; });
+        let child, threw = "nothing";
+        try {
+          child = Bun.spawn({
+            cmd: [process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
+            stdin: new ReadableStream({
+              type: "direct",
+              pull(controller) {
+                controller.write("before throw|");
+                controller.flush();
+                throw new Error("sync pull boom");
+              },
+            }),
+            stdout: "pipe",
+          });
+        } catch (e) {
+          threw = e.message;
+        }
+        const [out, exitCode] = child ? await Promise.all([child.stdout.text(), child.exited]) : ["", "no child"];
+        await Bun.sleep(0);
+        console.log(JSON.stringify({ threw, returned: typeof child, out, exitCode, uncaught }));
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).not.toContain("sync pull boom");
+    expect(JSON.parse(stdout)).toEqual({
+      threw: "nothing",
+      returned: "object",
+      out: "before throw|",
+      exitCode: 0,
+      uncaught: 0,
+    });
+    expect(exitCode).toBe(0);
+  });
+
   // The ReadableStream -> stdin FileSink pump intentionally does not await the
   // Promise FileSink.write() returns for writes it cannot complete synchronously
   // (a full pipe on POSIX, every pipe write on Windows). When the child dies

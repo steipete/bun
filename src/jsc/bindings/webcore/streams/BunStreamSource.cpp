@@ -857,9 +857,19 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
     pullArgs.append(sinkController);
     ASSERT(!pullArgs.hasOverflowed());
     JSValue maybePromise = call(globalObject, pull, getCallData(pull), underlyingSource, pullArgs);
-    RETURN_IF_EXCEPTION(scope, {});
+    // `pull` is a callback returning Promise<undefined>: a synchronous throw is its rejection.
+    // The sink has started and may already hold bytes the callback wrote, so the caller gets the
+    // same settled pump promise as for `async pull() { throw e }` rather than an abrupt return
+    // after those side effects. A VM termination is not converted.
+    JSPromise* pullPromise;
+    if (JSC::Exception* exception = scope.exception()) [[unlikely]] {
+        TRY_CLEAR_EXCEPTION(scope, {});
+        pullPromise = promiseRejectedWith(globalObject, exception->value());
+    } else {
+        pullPromise = dynamicDowncast<JSPromise>(maybePromise);
+    }
 
-    if (auto* pullPromise = dynamicDowncast<JSPromise>(maybePromise)) {
+    if (pullPromise) {
         auto* result = JSPromise::create(vm, globalObject->promiseStructure());
         pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReturnUndefined(), jsUndefined(), result, jsUndefined());
         return result;
