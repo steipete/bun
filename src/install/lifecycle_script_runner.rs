@@ -661,6 +661,10 @@ impl<'a> LifecycleScriptSubprocess<'a> {
             (*manager)
                 .active_lifecycle_scripts
                 .insert(this.cast::<LifecycleScriptSubprocess<'static>>());
+            // Before the spawn, so that no signal can end `bun install` between
+            // the child's start and the handler's installation.
+            #[cfg(unix)]
+            crate::lifecycle_signals::on_script_started(manager);
             let spawned = match bun_spawn::spawn_process(
                 &spawn_options,
                 // argv is `[*const c_char; 4]` with trailing null — exactly the
@@ -670,6 +674,8 @@ impl<'a> LifecycleScriptSubprocess<'a> {
             ) {
                 Ok(Ok(s)) => s,
                 res => {
+                    #[cfg(unix)]
+                    crate::lifecycle_signals::on_script_exited();
                     #[cfg(windows)]
                     {
                         // `spawn_process_windows` only `heap::take`s the `Stdio::Buffer`
@@ -762,9 +768,6 @@ impl<'a> LifecycleScriptSubprocess<'a> {
             // dispatch below may reenter `on_process_exit` through it without
             // aliasing. It outlives `process`.
             (*process).set_exit_handler(ProcessExit::new(ProcessExitKind::LifecycleScript, this));
-            // Before `watch_or_reap`: it can dispatch the exit synchronously.
-            #[cfg(unix)]
-            crate::lifecycle_signals::on_script_started(manager);
 
             if let Err(err) = (*process).watch_or_reap() {
                 if !(*process).has_exited() {

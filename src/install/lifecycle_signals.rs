@@ -35,7 +35,9 @@ const SIGNALS: [c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 /// The last signal received, 0 when none.
 static PENDING: AtomicI32 = AtomicI32::new(0);
 /// Set while `TASK` sits in the event loop queue. A node must not be pushed
-/// twice.
+/// twice. `PENDING` and `QUEUED` are `SeqCst`: a handler that finds `QUEUED`
+/// set relies on the queued task to read its `PENDING` store, and the handler
+/// can run on any thread.
 static QUEUED: AtomicBool = AtomicBool::new(false);
 /// Set once the scripts have been signalled and the install is draining.
 static DRAINING: AtomicBool = AtomicBool::new(false);
@@ -63,13 +65,14 @@ pub(crate) fn pending() -> Option<bun_core::SignalCode> {
 }
 
 fn received() -> bun_core::SignalCode {
-    u8::try_from(PENDING.load(Ordering::Relaxed))
+    u8::try_from(PENDING.load(Ordering::SeqCst))
         .ok()
         .and_then(bun_core::SignalCode::from_raw)
         .unwrap_or(bun_core::SignalCode::DEFAULT)
 }
 
-/// A lifecycle script was spawned. Installs the handlers on the first one.
+/// A lifecycle script is about to be spawned. Installs the handlers on the
+/// first one.
 ///
 /// `manager` is the live `PackageManager` that owns the script. It is stored
 /// and dereferenced from the signal task until `on_script_exited` removes the
@@ -81,9 +84,9 @@ pub(crate) fn on_script_started(manager: *mut PackageManager) {
     }
 }
 
-/// A lifecycle script exited (after it left `active_lifecycle_scripts`).
-/// Restores the dispositions after the last one, or dies by the forwarded
-/// signal when draining.
+/// A lifecycle script exited (after it left `active_lifecycle_scripts`), or
+/// failed to spawn. Restores the dispositions after the last one, or dies by
+/// the forwarded signal when draining.
 pub(crate) fn on_script_exited() {
     if RUNNING.fetch_sub(1, Ordering::Relaxed) != 1 {
         return;
@@ -120,6 +123,8 @@ fn install(manager: *mut PackageManager) {
         );
     }
     MANAGER.store(manager, Ordering::Relaxed);
+    // Before the dispositions: the handler never runs without a loop.
+    EVENT_LOOP.store(mini, Ordering::Release);
 
     // SAFETY: all-zero is a valid `libc::sigaction`; `sigemptyset`/`sigaction`
     // take pointers to these stack and static values.
@@ -143,8 +148,6 @@ fn install(manager: *mut PackageManager) {
             libc::sigaction(*sig, &raw const act, &raw mut previous[i]);
         }
     }
-    // Published last: the handler does nothing until it sees the loop.
-    EVENT_LOOP.store(mini, Ordering::Release);
 }
 
 fn uninstall() {
@@ -164,15 +167,17 @@ fn uninstall() {
 }
 
 extern "C" fn handler(sig: c_int) {
-    PENDING.store(sig, Ordering::Relaxed);
-    if QUEUED.swap(true, Ordering::AcqRel) {
+    PENDING.store(sig, Ordering::SeqCst);
+    if QUEUED.swap(true, Ordering::SeqCst) {
         return;
     }
     let event_loop = EVENT_LOOP.load(Ordering::Acquire);
     if event_loop.is_null() {
-        // Not reachable while the handler is installed (see `uninstall`).
-        // Take the default action rather than drop the signal: `sig` is
-        // blocked inside its own handler, so the re-raise lands on return.
+        // Only reachable on another thread while `uninstall` restores the
+        // dispositions, so no script runs. Take the default action rather
+        // than drop the signal: `sig` is blocked inside its own handler, so
+        // the re-raise lands on return.
+        QUEUED.store(false, Ordering::SeqCst);
         // SAFETY: all-zero is a valid `libc::sigaction`; both calls are
         // async-signal-safe.
         unsafe {
@@ -196,7 +201,7 @@ extern "C" fn handler(sig: c_int) {
 /// Runs on the install thread. Forwards the signal to every running script,
 /// or SIGKILLs them when one was already forwarded.
 fn on_signal_task(_: *mut (), _: *mut ()) {
-    QUEUED.store(false, Ordering::Release);
+    QUEUED.store(false, Ordering::SeqCst);
     let sig = received();
     let manager = MANAGER.load(Ordering::Relaxed);
     if manager.is_null() || RUNNING.load(Ordering::Relaxed) == 0 {
