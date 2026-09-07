@@ -116,6 +116,8 @@ pub enum Error {
     HTTP404,
     #[error("GitHubIsDown")]
     GitHubIsDown,
+    #[error("UntrustedTempDir")]
+    UntrustedTempDir,
     #[error("UpgradeFailedMissingExecutable")]
     UpgradeFailedMissingExecutable,
     #[error("UpgradeFailedBecauseOfMissingExecutableDir")]
@@ -448,6 +450,7 @@ impl Error {
             Self::lcovCoverageError => "lcovCoverageError",
             Self::HTTP404 => "HTTP404",
             Self::GitHubIsDown => "GitHubIsDown",
+            Self::UntrustedTempDir => "UntrustedTempDir",
             Self::UpgradeFailedMissingExecutable => "UpgradeFailedMissingExecutable",
             Self::UpgradeFailedBecauseOfMissingExecutableDir => {
                 "UpgradeFailedBecauseOfMissingExecutableDir"

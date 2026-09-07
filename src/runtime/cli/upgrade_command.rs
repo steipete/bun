@@ -51,7 +51,24 @@ pub(crate) trait FileSystemTmpdirExt {
 }
 impl FileSystemTmpdirExt for fs::FileSystem {
     fn tmpdir(&mut self) -> crate::Result<sys::Dir> {
-        sys::Dir::open(fs::RealFS::tmpdir_path()).map_err(Into::into)
+        let path = fs::RealFS::tmpdir_path();
+        let dir = sys::Dir::open(path)?;
+        // Every caller puts code there that bun runs next: the `bun upgrade`
+        // download, the addons embedded in a compiled executable, the
+        // `bun:ffi` cc() headers. The owner of a directory renames any entry
+        // in it whatever that entry's own mode bits say, so a temp directory
+        // another user can modify lets that user put their file where bun is
+        // about to read one back.
+        #[cfg(unix)]
+        // SAFETY: geteuid() takes no arguments and cannot fail.
+        if !sys::dir_chain_is_stable(dir.fd(), unsafe { libc::geteuid() }) {
+            Output::err_generic(
+                "refusing to use temp directory <b>{}<r> because another user can replace entries in it or in a directory above it. Set <b>$TMPDIR<r> to a directory you own.",
+                (bstr::BStr::new(path),),
+            );
+            return Err(crate::Error::UntrustedTempDir);
+        }
+        Ok(dir)
     }
 }
 
@@ -728,6 +745,8 @@ impl UpgradeCommand {
 
             let save_dir_: sys::Dir = match filesystem.tmpdir() {
                 Ok(d) => d,
+                // `tmpdir()` prints why it refused the directory.
+                Err(crate::Error::UntrustedTempDir) => Global::exit(1),
                 Err(err) => {
                     Output::err_generic("Failed to open temporary directory: {}", (err.name(),));
                     Global::exit(1);

@@ -1327,6 +1327,101 @@ it.concurrent.skipIf(isWindows)(
   },
 );
 
+// The cache root check above starts at the first path component below the
+// temp dir, so it says nothing about the temp dir itself. The owner of a
+// directory renames any entry in it whatever that entry's own mode bits say,
+// and a group- or other-writable directory gives everyone the same power
+// unless the sticky bit is set. Either way that user can swap the whole cache
+// root for their own tree after bunx checked it, so bunx refuses such a temp
+// dir before it reads or writes anything under it.
+it.concurrent.skipIf(isWindows)("refuses a temp directory that other local users can modify", async () => {
+  const { x_dir, env } = setup();
+  const pkg = "bunx-temp-dir-fixture";
+
+  const run = (tmp = env.TMPDIR) => {
+    const subprocess = spawn({
+      cmd: [bunExe(), "x", "--no-install", pkg],
+      cwd: x_dir,
+      stdout: "pipe",
+      stdin: "ignore",
+      stderr: "pipe",
+      env: { ...env, TEMP: tmp, TMPDIR: tmp, BUN_TMPDIR: tmp },
+    });
+    return Promise.all([subprocess.stderr.text(), subprocess.stdout.text(), subprocess.exited] as const);
+  };
+
+  // The private temp dir the harness made is accepted: bunx gets past the
+  // checks and fails later with the normal --no-install message. So is a
+  // temp dir that does not exist yet below it, because the install creates
+  // that one as us.
+  for (const tmp of [env.TMPDIR, join(env.TMPDIR, "missing", "temp")]) {
+    const [err, out, exitCode] = await run(tmp);
+    expect(err).not.toContain("refusing to use temp directory");
+    expect(err).toContain(`Could not find an existing '${pkg}' binary to run.`);
+    expect(out).toHaveLength(0);
+    expect(exitCode).toBe(1);
+  }
+
+  // World-writable without the sticky bit: any local user can rename the
+  // cache root. A missing temp dir below it is refused too, since the same
+  // users can rename that one once it exists.
+  chmodSync(env.TMPDIR, 0o777);
+  for (const tmp of [env.TMPDIR, join(env.TMPDIR, "missing", "temp")]) {
+    const [err, out, exitCode] = await run(tmp);
+    expect(err).toContain("refusing to use temp directory");
+    expect(err).toContain("another user can replace entries in it");
+    expect(out).toHaveLength(0);
+    expect(exitCode).toBe(1);
+  }
+
+  // World-writable and sticky, like /tmp: only the owner of an entry, the
+  // owner of the directory, and root can rename it. Accepted.
+  chmodSync(env.TMPDIR, 0o1777);
+  {
+    const [err, out, exitCode] = await run();
+    expect(err).not.toContain("refusing to use temp directory");
+    expect(err).toContain(`Could not find an existing '${pkg}' binary to run.`);
+    expect(out).toHaveLength(0);
+    expect(exitCode).toBe(1);
+  }
+});
+
+// A temp dir that is reached through a symlink is checked where it really
+// lives, and from then on bunx uses its real path: the symlink itself could
+// sit in a directory another user can modify, and that user could point it
+// elsewhere between the check and the exec.
+it.concurrent.skipIf(isWindows)("runs a cached binary by the real path of a symlinked temp directory", async () => {
+  const { x_dir, env } = setup();
+  const pkg = "bunx-temp-dir-symlink-fixture";
+
+  // A cache entry made by hand, the way an earlier `bunx` run leaves it.
+  const bin = join(env.TMPDIR, `bunx-${process.getuid!()}-${pkg}@latest`, "node_modules", ".bin", pkg);
+  await mkdir(join(bin, ".."), { recursive: true });
+  await writeFile(bin, `#!/bin/sh\necho "ran $0"\n`, { mode: 0o755 });
+
+  const open = tmpdirSync();
+  chmodSync(open, 0o777);
+  const link = join(open, "temp");
+  symlinkSync(env.TMPDIR, link);
+
+  await using subprocess = spawn({
+    cmd: [bunExe(), "x", "--no-install", pkg],
+    cwd: x_dir,
+    stdout: "pipe",
+    stdin: "ignore",
+    stderr: "pipe",
+    env: { ...env, TEMP: link, TMPDIR: link, BUN_TMPDIR: link },
+  });
+  const [err, out, exitCode] = await Promise.all([
+    subprocess.stderr.text(),
+    subprocess.stdout.text(),
+    subprocess.exited,
+  ]);
+  expect(err).not.toContain("refusing to use temp directory");
+  expect(out).toBe(`ran ${bin}\n`);
+  expect(exitCode).toBe(0);
+});
+
 it.concurrent.skipIf(isWindows)(
   "validates every path component of a scoped package's bunx cache directory",
   async () => {

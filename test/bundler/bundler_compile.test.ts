@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "fs";
+import { chmodSync, readdirSync, rmSync, symlinkSync } from "fs";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
@@ -1923,3 +1923,78 @@ test("a standalone executable does not run a synchronous full GC after loading i
   expect(stderr).not.toContain("FullCollection");
   expect(exitCode).toBe(0);
 });
+
+// A standalone executable writes each embedded native library into the temp
+// dir and loads it back with dlopen() by path. The owner of a directory
+// renames any entry in it whatever that entry's own mode bits say, and a
+// group- or other-writable directory gives everyone the same power unless the
+// sticky bit is set. Such a user swaps the file between the write and the
+// load, so bun refuses the temp dir instead. Unix only: the rule is about uid
+// and the sticky bit.
+test.skipIf(isWindows)(
+  "a standalone executable refuses to extract an embedded addon into a temp dir other users can modify",
+  async () => {
+    using dir = tempDir("compile-embedded-addon-temp-dir", {
+      // Not a real addon, so the load always fails, and the error names the
+      // path dlopen() got. What this test reads is whether bun put the bytes
+      // in the temp dir at all, and which path it loaded them by.
+      "fake.node": "not an addon\n",
+      "app.js": `try { require("./fake.node"); } catch (e) { console.log("load failed: " + e.message); }`,
+    });
+    const cwd = String(dir);
+    await using build = Bun.spawn({
+      cmd: [bunExe(), "build", "--compile", "app.js", "--outfile", "app"],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, buildStderr, buildExit] = await Promise.all([build.stdout.text(), build.stderr.text(), build.exited]);
+    expect(buildStderr).not.toContain("error:");
+    expect(buildExit).toBe(0);
+
+    const runWithTempDir = async (tmp: string) => {
+      await using proc = Bun.spawn({
+        cmd: [join(cwd, "app")],
+        env: { ...bunEnv, BUN_TMPDIR: tmp, TMPDIR: tmp },
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    };
+    const extracted = (tmp: string) => readdirSync(tmp).filter(entry => entry.endsWith(".node"));
+
+    using privateTempDir = tempDir("compile-embedded-addon-private", {});
+    {
+      const [stdout, stderr] = await runWithTempDir(String(privateTempDir));
+      expect(stderr).not.toContain("refusing to use temp directory");
+      expect(extracted(String(privateTempDir))).toHaveLength(1);
+      expect(stdout).toStartWith("load failed: ");
+      expect(stdout).toContain(join(String(privateTempDir), extracted(String(privateTempDir))[0]));
+    }
+
+    using openTempDir = tempDir("compile-embedded-addon-open", {});
+    chmodSync(String(openTempDir), 0o777);
+    {
+      const [stdout, stderr] = await runWithTempDir(String(openTempDir));
+      expect(stderr).toContain("refusing to use temp directory");
+      expect(stdout).toStartWith("load failed: ");
+      expect(extracted(String(openTempDir))).toHaveLength(0);
+    }
+
+    // Reached through a symlink that lives in the open dir, the private dir
+    // is still accepted, but the addon is loaded by its real path so that the
+    // open dir is not resolved a second time.
+    const link = join(String(openTempDir), "temp");
+    symlinkSync(String(privateTempDir), link);
+    {
+      const [stdout, stderr] = await runWithTempDir(link);
+      expect(stderr).not.toContain("refusing to use temp directory");
+      expect(stdout).toStartWith("load failed: ");
+      expect(stdout).toContain(join(String(privateTempDir), extracted(String(privateTempDir))[0]));
+      expect(stdout).not.toContain(link);
+    }
+  },
+  60_000,
+);

@@ -4648,6 +4648,14 @@ pub(crate) fn resolve_embedded_file_to_buf(
     // instead of being followed.
     let tmpdir = (*Fs::FileSystem::instance()).tmpdir().ok()?;
     let tmpdir_fd: bun_sys::Fd = tmpdir.fd;
+    // `dlopen(2)` resolves the path again, so give it the real path of the
+    // directory `tmpdir()` checked instead of the `$TMPDIR` spelling: a
+    // symlink on the way there could live in a directory the check never saw.
+    let mut tmpdir_path_buf = bun_paths::path_buffer_pool::get();
+    let tmpdir_path: &[u8] = match bun_sys::get_fd_path(tmpdir_fd, &mut tmpdir_path_buf) {
+        Ok(real_path) => real_path,
+        Err(_) => Fs::RealFS::tmpdir_path(),
+    };
     if let Ok(st) = bun_sys::lstatat(tmpdir_fd, canonical_name) {
         let size_ok = st.st_size as usize == file_contents.len();
         #[cfg(unix)]
@@ -4655,11 +4663,7 @@ pub(crate) fn resolve_embedded_file_to_buf(
         #[cfg(windows)]
         let ours = true;
         if size_ok && ours {
-            return write_absolute(
-                out_buf,
-                Fs::RealFS::tmpdir_path(),
-                canonical_name.as_bytes(),
-            );
+            return write_absolute(out_buf, tmpdir_path, canonical_name.as_bytes());
         }
     }
 
@@ -4689,7 +4693,7 @@ pub(crate) fn resolve_embedded_file_to_buf(
     } else {
         scratch_name
     };
-    write_absolute(out_buf, Fs::RealFS::tmpdir_path(), final_name.as_bytes())
+    write_absolute(out_buf, tmpdir_path, final_name.as_bytes())
 }
 
 /// Writes `{tmpdir}/{name}` into `out_buf` and returns the length.

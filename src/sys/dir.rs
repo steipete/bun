@@ -479,6 +479,70 @@ impl FdDirExt for Fd {
     }
 }
 
+/// Whether a user other than us or root can rename or unlink the entries of
+/// the directory `st` describes.
+///
+/// The owner of a directory renames its entries whatever mode bits the entry
+/// itself has, and a group- or other-writable directory gives the same power
+/// to everyone unless the sticky bit is set. So a check on an entry only
+/// holds while this returns `false` for the directory that holds it.
+#[cfg(unix)]
+fn entries_replaceable_by_others(st: &Stat, euid: u32) -> bool {
+    if st.st_uid != euid && st.st_uid != 0 {
+        return true;
+    }
+    let mode = st.st_mode as u32;
+    mode & (S::IWGRP | S::IWOTH) != 0 && mode & S::ISVTX == 0
+}
+
+/// Whether only we or root can rename or unlink the entries of `dir` and of
+/// every directory above it, so a path that resolves through them keeps
+/// naming the same inodes.
+///
+/// Walks `..` from `dir` instead of the components of a path, so the real
+/// parents of a symlinked directory are the ones checked, and the walk needs
+/// only search permission on them.
+#[cfg(unix)]
+pub fn dir_chain_is_stable(dir: Fd, euid: u32) -> bool {
+    let Ok(mut st) = fstat(dir) else {
+        return false;
+    };
+    if entries_replaceable_by_others(&st, euid) {
+        return false;
+    }
+    let mut dots = bun_paths::path_buffer_pool::get();
+    let mut len = 0usize;
+    loop {
+        if len + b"/..".len() >= dots.len() {
+            return false;
+        }
+        if len > 0 {
+            dots[len] = bun_paths::SEP;
+            len += 1;
+        }
+        dots[len..len + 2].copy_from_slice(b"..");
+        len += 2;
+        dots[len] = 0;
+        let Ok(up) = fstatat(dir, ZStr::from_buf(&dots[..], len)) else {
+            return false;
+        };
+        // ".." of the root is the root itself.
+        if up.st_dev == st.st_dev && up.st_ino == st.st_ino {
+            return true;
+        }
+        if entries_replaceable_by_others(&up, euid) {
+            return false;
+        }
+        st = up;
+    }
+}
+
+#[cfg(not(unix))]
+#[inline(always)]
+pub fn dir_chain_is_stable(_dir: Fd, _euid: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

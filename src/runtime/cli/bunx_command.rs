@@ -18,7 +18,7 @@ use bun_core::{ZStr, strings};
 use bun_install::dependency::VersionTag;
 use bun_install::update_request::{self, UpdateRequest};
 use bun_parsers::json;
-use bun_paths::{self, DELIMITER};
+use bun_paths::{self, DELIMITER, PathBuffer};
 use bun_resolver::fs::RealFS;
 #[cfg(windows)]
 use bun_sys::FdExt as _;
@@ -566,6 +566,57 @@ impl BunxCommand {
         true
     }
 
+    /// The cache root below the temp dir is only as private as the directories
+    /// above it: the owner of a directory renames any entry in it whatever
+    /// that entry's own mode bits say. `is_trusted_cache_root` starts at the
+    /// first component below the temp dir, so the temp dir and everything
+    /// above it is checked here, and `None` means refuse.
+    ///
+    /// A temp dir that does not exist yet is created by the install, as us, so
+    /// the nearest existing directory above it is the one that gets checked.
+    /// When the temp dir exists, the returned path is its real path: the
+    /// install and the exec resolve the path again, and a symlink on the way
+    /// there could live in a directory the check never saw.
+    #[cfg(unix)]
+    fn trusted_temp_dir<'a>(
+        temp_dir: &'a [u8],
+        uid: libc::uid_t,
+        real_path_buf: &'a mut PathBuffer,
+    ) -> Option<&'a [u8]> {
+        let mut existing = temp_dir;
+        let dir = loop {
+            match bun_sys::Dir::open(existing) {
+                Ok(dir) => break dir,
+                Err(err)
+                    if err.get_errno() == bun_sys::E::ENOENT && existing != b".".as_slice() =>
+                {
+                    existing = bun_paths::dirname(existing).unwrap_or(b".");
+                }
+                Err(_) => return None,
+            }
+        };
+        if !bun_sys::dir_chain_is_stable(dir.fd(), uid) {
+            return None;
+        }
+        if existing.len() != temp_dir.len() {
+            return Some(temp_dir);
+        }
+        match bun_sys::get_fd_path(dir.fd(), real_path_buf) {
+            Ok(real_path) => Some(&*real_path),
+            Err(_) => Some(temp_dir),
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[inline(always)]
+    fn trusted_temp_dir<'a>(
+        temp_dir: &'a [u8],
+        _uid: u32,
+        _real_path_buf: &'a mut PathBuffer,
+    ) -> Option<&'a [u8]> {
+        Some(temp_dir)
+    }
+
     #[cfg(unix)]
     fn is_trusted_cache_root(cache_root: &[u8], temp_dir_len: usize, uid: libc::uid_t) -> bool {
         let mut buf = bun_paths::path_buffer_pool::get();
@@ -896,7 +947,27 @@ impl BunxCommand {
             BStr::new(result_package_name)
         );
 
-        let temp_dir = RealFS::platform_temp_dir();
+        #[cfg(unix)]
+        // SAFETY: getuid() is always safe to call (no preconditions, never fails)
+        let uid = unsafe { libc::getuid() };
+        #[cfg(windows)]
+        let uid = bun_sys::windows::user_unique_id();
+
+        let mut real_temp_dir_buf = bun_paths::path_buffer_pool::get();
+        let temp_dir: &[u8] = match Self::trusted_temp_dir(
+            RealFS::platform_temp_dir(),
+            uid,
+            &mut real_temp_dir_buf,
+        ) {
+            Some(dir) => dir,
+            None => {
+                Output::err_generic(
+                    "refusing to use temp directory <b>{}<r> for the bunx cache because another user can replace entries in it or in a directory above it. Set <b>$TMPDIR<r> to a directory you own.",
+                    format_args!("{}", BStr::new(RealFS::platform_temp_dir())),
+                );
+                Global::exit(1);
+            }
+        };
 
         let path_for_bin_dirs: Vec<u8> = 'brk: {
             if ignore_cwd.is_empty() {
@@ -944,12 +1015,6 @@ impl BunxCommand {
         //     where a user can replace the directory with malicious code.
         //
         // If this format changes, please update cache clearing code in package_manager_command.rs
-        #[cfg(unix)]
-        // SAFETY: getuid() is always safe to call (no preconditions, never fails)
-        let uid = unsafe { libc::getuid() };
-        #[cfg(windows)]
-        let uid = bun_sys::windows::user_unique_id();
-
         path = {
             let mut v = Vec::new();
             let path_is_nonzero = !path.is_empty();
