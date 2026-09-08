@@ -2,7 +2,7 @@
 // (linker-order.test.ts "records exact entries, and keeps them across an exec'd
 // child"). Everything here prints facts about a process tree that stopped
 // making progress; nothing here changes what the test asserts.
-import { existsSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function readMaybe(path: string, max = 4096): string {
@@ -392,6 +392,215 @@ export async function runHungBatchRounds(label: string, budgetMs: number): Promi
 }
 
 /**
+ * Markers: a worker writes `<dir>/<kind>-<pid>-<tag>` before a step that may
+ * stall and removes it after. The probe process (never blocked itself) polls
+ * the directory and dumps the kernel-side state of a worker whose marker got
+ * old: every thread's state/wchan/syscall, its fds with each epoll's interest
+ * list, its children, and its unix sockets' queues.
+ */
+export function markStep(kind: "sync" | "async", tag: string): () => void {
+  const dir = process.env.PROBE_MARK_DIR;
+  if (!dir) return () => {};
+  const file = join(dir, `${kind}-${process.pid}-${tag.replace(/[^A-Za-z0-9_.-]/g, "_")}`);
+  try {
+    writeFileSync(file, String(Date.now()));
+  } catch {}
+  return () => {
+    try {
+      unlinkSync(file);
+    } catch {}
+  };
+}
+
+function describeWorker(pid: number): string {
+  const lines: string[] = [];
+  try {
+    for (const tid of readdirSync(`/proc/${pid}/task`)) {
+      const base = `/proc/${pid}/task/${tid}`;
+      const stat = readMaybe(`${base}/stat`);
+      const name = stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")"));
+      const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      lines.push(
+        `  tid ${tid} (${name}) state=${after[0]} utime=${after[11]} stime=${after[12]} wchan=${readMaybe(`${base}/wchan`)} syscall=${readMaybe(`${base}/syscall`).split(" ").slice(0, 5).join(" ")}`,
+      );
+    }
+  } catch (error) {
+    lines.push(`  <threads: ${error}>`);
+  }
+  const fdLines: string[] = [];
+  try {
+    for (const fd of readdirSync(`/proc/${pid}/fd`).sort((a, b) => Number(a) - Number(b))) {
+      let target = "?";
+      try {
+        target = readlinkSync(`/proc/${pid}/fd/${fd}`);
+      } catch {}
+      let extra = "";
+      if (target === "anon_inode:[eventpoll]") {
+        const tfds = readMaybe(`/proc/${pid}/fdinfo/${fd}`, 65536)
+          .split("\n")
+          .filter(l => l.startsWith("tfd:"))
+          .map(l =>
+            l
+              .replace(/\s+/g, " ")
+              .replace(/ pos:0 ino:\S+ sdev:\S+/, "")
+              .trim(),
+          );
+        extra = ` {${tfds.join("; ")}}`;
+      } else if (/^(socket|pipe|anon_inode)/.test(target)) {
+        extra = ` (${readMaybe(`/proc/${pid}/fdinfo/${fd}`, 400)
+          .split("\n")
+          .filter(l => /^flags/.test(l))
+          .join("")
+          .replace(/\s+/g, "")})`;
+      }
+      fdLines.push(`${fd}->${target}${extra}`);
+    }
+  } catch (error) {
+    fdLines.push(`<fds: ${error}>`);
+  }
+  lines.push(`  fds: ${fdLines.join("  ")}`);
+  const kids = childrenOf(pid);
+  lines.push(`  children: ${kids.length ? kids.map(k => describeProc(k).split("\n")[0]).join(" | ") : "none"}`);
+  return lines.join("\n");
+}
+
+/** Polls `dir` for stale markers and prints one report per stale marker. The returned function stops and reports the count. */
+export function watchMarkers(dir: string, thresholds: { sync: number; async: number }): () => number {
+  const reported = new Set<string>();
+  let reports = 0;
+  const timer = setInterval(async () => {
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    for (const name of names) {
+      if (reported.has(name) || reports >= 6) continue;
+      const m = /^(sync|async)-(\d+)-(.*)$/.exec(name);
+      if (!m) continue;
+      const started = Number(readMaybe(join(dir, name)));
+      if (!started || now - started < thresholds[m[1] as "sync" | "async"]) continue;
+      reported.add(name);
+      reports++;
+      const pid = Number(m[2]);
+      const ss = await run(["sh", "-c", `ss -xapn 2>/dev/null | grep -E 'Recv-Q|pid=${pid},' | head -40`]);
+      console.error(
+        [
+          `=== STALE ${m[1]} step: worker pid ${pid}, ${m[3]}, ${now - started} ms old`,
+          describeWorker(pid),
+          `  unix sockets:\n${ss}`,
+          `=== end STALE report`,
+        ].join("\n"),
+      );
+    }
+  }, 250);
+  return () => {
+    clearInterval(timer);
+    return reports;
+  };
+}
+
+/**
+ * Many copies of the tracer+pty case pair inside `bun test --parallel` workers,
+ * for `budgetMs`: the setting in which the spawnSync stall reproduced once.
+ * Workers may run under the close auditor; the probe process watches markers.
+ */
+export async function runGeneratedRounds(opts: {
+  label: string;
+  budgetMs: number;
+  auditSo?: string;
+}): Promise<{ rounds: number; cases: number; stalls: number; staleReports: number }> {
+  const { bunEnv, bunExe, tempDir } = await import("harness");
+  const repo = join(import.meta.dir, "../../../..");
+  const helpers = join(import.meta.dir, "functrace-probe-helpers.ts");
+  const cases = process.arch === "arm64" ? 48 : 12;
+  const neighbors = HUNG_BATCH.filter(f =>
+    /bundler_loader|webview\/webview\.test|bun-serve-html\.test|fifo|filesink|spawn\.ipc|sqlite-sql|heap-prof|websocket-pause|self-reference|pipeline_stack|bun_test\.test/.test(
+      f,
+    ),
+  );
+  using generated = tempDir(`functrace-cases-${opts.label}`, { marks: {} });
+  const dir = String(generated);
+  const markDir = join(dir, "marks");
+  const files: string[] = [];
+  for (let i = 0; i < cases; i++) {
+    const file = join(dir, `tracer-${String(i).padStart(3, "0")}.test.ts`);
+    writeFileSync(
+      file,
+      [
+        `import { describe, it } from "bun:test";`,
+        `import { mkdirSync } from "node:fs";`,
+        `import { runPtyCase, runTracerCase } from ${JSON.stringify(helpers)};`,
+        `const root = ${JSON.stringify(join(dir, `case-${i}`))};`,
+        `mkdirSync(root, { recursive: true });`,
+        `describe("tracer", () => {`,
+        `  it.concurrent(${JSON.stringify(`traced fixture ${i}`)}, async () => {`,
+        `    await runTracerCase({ root, diag: ${JSON.stringify(join(dir, "diag.txt"))}, tag: ${JSON.stringify(`case-${i}`)} });`,
+        `  }, 65000);`,
+        `});`,
+        `describe("pty", () => {`,
+        `  it.concurrent(${JSON.stringify(`pty runner ${i}`)}, async () => {`,
+        `    await runPtyCase({ root, tag: ${JSON.stringify(`case-${i}`)} });`,
+        `  }, 65000);`,
+        `});`,
+        ``,
+      ].join("\n"),
+    );
+    files.push(file);
+  }
+
+  const stopWatching = watchMarkers(markDir, { sync: 2500, async: 15_000 });
+  let stalls = 0;
+  let rounds = 0;
+  let last = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 + Math.max(last, 12_000) < opts.budgetMs && stalls < 2) {
+    const started = performance.now();
+    const auditLog = join(dir, `closeaudit.${rounds}.log`);
+    const env: Record<string, string | undefined> = { ...bunEnv, PROBE_MARK_DIR: markDir };
+    if (opts.auditSo) {
+      env.LD_PRELOAD = opts.auditSo;
+      env.CLOSEAUDIT_LOG = auditLog;
+    }
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...files, ...neighbors],
+      cwd: repo,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    last = performance.now() - started;
+    const out = stdout + stderr;
+    const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
+    const bad = /STALLED|timed out|REPEAT trap/.test(out);
+    const audit = opts.auditSo ? await readCloseAudit(auditLog, bunExe()) : "";
+    const ebadf = audit ? audit.split("\n").filter(l => l.includes("EBADF pid")).length : 0;
+    console.log(`${opts.label} round ${rounds}: ${cases} cases, ${summary}, ${ebadf} EBADF closes${bad ? " BAD" : ""}`);
+    if (audit) console.log(audit.split("\n").slice(0, 80).join("\n"));
+    if (bad) {
+      stalls++;
+      console.error(
+        `=== ${opts.label} round ${rounds} output (filtered)\n${out
+          .split("\n")
+          .filter(line => !/^[.\s]*$/.test(line))
+          .slice(-400)
+          .join("\n")}`,
+      );
+    }
+    rounds++;
+  }
+  const staleReports = stopWatching();
+  console.log(
+    `${opts.label}: ${rounds} rounds, ${rounds * cases} cases, ${stalls} rounds with a stall, ${staleReports} stale-step reports, ${((performance.now() - t0) / 1000).toFixed(1)} s`,
+  );
+  return { rounds, cases: rounds * cases, stalls, staleReports };
+}
+
+/**
  * The body of linker-order.test.ts's pty-runner case. It runs concurrently with
  * the tracer case in the real file: two more compiles, a bun under a pty and a
  * bun on pipes, in the same worker process at the same moment.
@@ -548,6 +757,7 @@ export async function runTracerCase(opts: {
   }, watchdogMs);
 
   try {
+    const unmarkCompile = markStep("async", `${tag}-compile`);
     await Promise.all([
       compile(["-shared", "-fPIC", "-o", tracer, join(root, "functrace-probe.c"), "-ldl", "-lpthread"]).then(() =>
         step("tracer"),
@@ -555,7 +765,10 @@ export async function runTracerCase(opts: {
       compile(["-o", fixture, join(import.meta.dir, "functrace-fixture.c")]).then(() => step("fixture")),
       compile(["-o", child, join(root, "child.c")]).then(() => step("child")),
     ]);
+    unmarkCompile();
+    const unmarkNm = markStep("sync", `${tag}-nm`);
     const symbols = readTextSymbols(fixture);
+    unmarkNm();
     step("nm");
     if (symbols.size <= 33) throw new Error(`nm listed ${symbols.size} text symbols`);
     const list = [...symbols.keys()].map(BigInt);
@@ -580,11 +793,13 @@ export async function runTracerCase(opts: {
     });
     spawned = proc;
     step(`spawn(${proc.pid})`);
+    const unmarkSpawn = markStep("async", `${tag}-fixture-${proc.pid}`);
     const [stdout, stderr, exitCode] = await Promise.all([
       proc.stdout.text().finally(() => ((settled.stdout = true), step("stdout"))),
       proc.stderr.text().finally(() => ((settled.stderr = true), step("stderr"))),
       proc.exited.finally(() => ((settled.exited = true), step("exited"))),
     ]);
+    unmarkSpawn();
     if (stdout.trim() !== "497" || stderr !== "" || exitCode !== 0) {
       throw new Error(`${tag}: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)} exit=${exitCode}`);
     }
