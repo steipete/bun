@@ -140,7 +140,7 @@ fn install(manager: *mut PackageManager) {
                 continue;
             }
             // An inherited SIG_IGN (`nohup`, a `&` job in a non-interactive
-            // shell) stays ignored, as it is for the scripts themselves.
+            // shell) stays ignored.
             if current.sa_sigaction == libc::SIG_IGN {
                 previous[i] = current;
                 continue;

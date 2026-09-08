@@ -4,38 +4,48 @@
 // keeps writing into node_modules.
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isPosix, tempDir } from "harness";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-// The hook records its pid, then waits. On SIGTERM/SIGINT/SIGHUP it records
-// the signal. With `exitOnSignal` it then exits 0, otherwise it keeps
-// running so that the test can check the escalation path.
-const hook = (exitOnSignal: boolean) => `
-  const { writeFileSync } = require("node:fs");
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-    process.on(sig, () => {
-      writeFileSync("got-signal", sig);
-      ${exitOnSignal ? "process.exit(0);" : ""}
-    });
-  }
-  writeFileSync("hook-pid", String(process.pid));
-  setInterval(() => {}, 1000);
+// The hook records its pid, then waits. On TERM/INT/HUP it records the
+// signal. In "exit" mode it then exits 0, otherwise it keeps running so that
+// the test can check the escalation path. `wait` on a background `sleep`
+// returns as soon as a trapped signal arrives, so the trap runs at once.
+const hook = `
+on_signal() {
+  printf %s "$1" > got-signal.tmp && mv got-signal.tmp got-signal
+  if [ "$mode" = exit ]; then exit 0; fi
+}
+mode=$1
+trap 'on_signal SIGTERM' TERM
+trap 'on_signal SIGINT' INT
+trap 'on_signal SIGHUP' HUP
+printf %s "$$" > hook-pid.tmp && mv hook-pid.tmp hook-pid
+while :; do
+  sleep 1 &
+  wait $!
+done
 `;
 
-const files = (exitOnSignal: boolean) => ({
+const files = (mode: "exit" | "stay") => ({
   "package.json": JSON.stringify({
     name: "app",
     version: "1.0.0",
-    scripts: { postinstall: `exec ${bunExe()} hook.js` },
+    // `exec` so that the hook is the direct child of bun install whatever
+    // the system shell does with `sh -c`.
+    scripts: { postinstall: `exec sh hook.sh ${mode}` },
   }),
-  "hook.js": hook(exitOnSignal),
+  "hook.sh": hook,
 });
 
+// Both files are written with a rename, so they are never seen half-written.
 async function waitForFile(path: string): Promise<string> {
-  while (!existsSync(path)) {
+  for (;;) {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {}
     await Bun.sleep(10);
   }
-  return readFileSync(path, "utf8");
 }
 
 function isAlive(pid: number): boolean {
@@ -63,12 +73,19 @@ function startInstall(dir: string) {
   });
 }
 
+async function readHookPid(dir: string): Promise<number> {
+  const pid = Number(await waitForFile(join(dir, "hook-pid")));
+  // Never hand 0 or NaN to kill(): pid 0 is the whole process group.
+  expect(pid).toBeGreaterThan(1);
+  return pid;
+}
+
 describe.skipIf(!isPosix).concurrent("bun install forwards signals to lifecycle scripts", () => {
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     test(`${signal} reaches the postinstall script and bun install waits for it`, async () => {
-      using dir = tempDir("install-signal", files(true));
+      using dir = tempDir("install-signal", files("exit"));
       await using proc = startInstall(String(dir));
-      const hookPid = Number(await waitForFile(join(String(dir), "hook-pid")));
+      const hookPid = await readHookPid(String(dir));
       try {
         expect(isAlive(hookPid)).toBe(true);
 
@@ -88,9 +105,9 @@ describe.skipIf(!isPosix).concurrent("bun install forwards signals to lifecycle 
   }
 
   test("a second signal kills a script that ignores the first one", async () => {
-    using dir = tempDir("install-signal-twice", files(false));
+    using dir = tempDir("install-signal-twice", files("stay"));
     await using proc = startInstall(String(dir));
-    const hookPid = Number(await waitForFile(join(String(dir), "hook-pid")));
+    const hookPid = await readHookPid(String(dir));
     try {
       proc.kill("SIGTERM");
       // bun install must still be alive once the hook has seen the signal.
@@ -102,6 +119,7 @@ describe.skipIf(!isPosix).concurrent("bun install forwards signals to lifecycle 
       proc.kill("SIGTERM");
       await proc.exited;
       expect(isAlive(hookPid)).toBe(false);
+      expect(await proc.stderr.text()).toContain(`"app" terminated by SIGKILL`);
       expect(proc.signalCode).toBe("SIGTERM");
     } finally {
       killQuietly(hookPid);
