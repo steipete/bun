@@ -533,6 +533,7 @@ impl<'a> Coordinator<'a> {
                 self.reporter
                     .todos_to_repeat_buf
                     .extend_from_slice(rd.str());
+                self.reporter.jest.unhandled_errors_between_tests += rd.u32();
             }
             frame::Kind::CoverageFile => {
                 use bun_sourcemap_jsc::code_coverage::wire;

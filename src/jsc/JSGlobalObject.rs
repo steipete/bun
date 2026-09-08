@@ -1353,6 +1353,12 @@ impl JSGlobalObject {
         Zig__GlobalObject__createForTestIsolation(old_global, console)
     }
 
+    /// A global that the `bun test --isolate` per-file swap already replaced.
+    /// Work a finished file left running still calls back and rejects into it.
+    pub fn is_retired_for_test_isolation(&self) -> bool {
+        Zig__GlobalObject__isRetiredForTestIsolation(self)
+    }
+
     pub fn to_type_error(&self, code: JscError, args: Arguments<'_>) -> JSValue {
         code.fmt(self, args)
     }
@@ -1590,6 +1596,7 @@ unsafe extern "C" {
         old_global: &JSGlobalObject,
         console: *mut c_void,
     ) -> *mut JSGlobalObject;
+    safe fn Zig__GlobalObject__isRetiredForTestIsolation(this: &JSGlobalObject) -> bool;
 }
 
 impl ScriptExecutionContextIdentifier {

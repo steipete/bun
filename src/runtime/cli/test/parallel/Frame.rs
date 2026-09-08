@@ -17,9 +17,10 @@ pub enum Kind {
     /// u32 scope_line}, u32 has_failure [, str name, str message, str body]
     TestDone,
     /// 9 × u32: file_idx, pass, fail, skip, todo, expectations, skipped_label,
-    /// files, unhandled; u64 elapsed_ns
+    /// files, unhandled (since the previous FileDone); u64 elapsed_ns
     FileDone,
-    /// 3 × str: failures, skips, todos (verbatim repeat-buffer bytes)
+    /// 3 × str: failures, skips, todos (verbatim repeat-buffer bytes);
+    /// u32 unhandled (errors counted after the last FileDone)
     RepeatBufs,
     // coordinator → worker
     /// u32 file_idx, str path

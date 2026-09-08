@@ -695,6 +695,91 @@ describe.concurrent("bun test --isolate", () => {
       }
     }
   });
+
+  // The swap kills a leaked subprocess but its `exited` promise still settles
+  // afterwards, in the finished file's realm. A throw from that continuation
+  // rejects a promise of the retired global. It must fail the run, as it does
+  // without --isolate, instead of being dropped. The next file did not cause
+  // it, so it is counted between tests and that file's test still passes.
+  test.each([
+    ["--isolate", ["--isolate"], {}],
+    // One worker takes both files (scale-up gated). The continuation can land
+    // while the worker waits for its next file, with no file active.
+    ["--parallel worker", ["--parallel=2"], { BUN_TEST_PARALLEL_SCALE_MS: "60000" }],
+  ])("a throw from a finished file's leaked continuation fails the run (%s)", async (_, args, env) => {
+    using dir = tempDir("isolate-leaked-rejection", {
+      "a-leak.test.ts": `
+        import { test, expect } from "bun:test";
+        import { writeFileSync } from "node:fs";
+        const marker = process.env.MARKER!;
+        test("leak a continuation that throws after this file ends", () => {
+          const child = Bun.spawn({ cmd: [process.execPath, "-e", "setInterval(()=>{}, 1e6)"], stdout: "ignore", stderr: "ignore" });
+          child.exited.then(() => {
+            writeFileSync(marker, "ran");
+            throw new Error("thrown by a-leak after it finished");
+          });
+          expect(child.pid).toBeGreaterThan(0);
+        });
+      `,
+      "b-wait.test.ts": `
+        import { test, expect } from "bun:test";
+        import { existsSync } from "node:fs";
+        test("runs until the leaked continuation has fired", async () => {
+          while (!existsSync(process.env.MARKER!)) await Bun.sleep(5);
+          expect(existsSync(process.env.MARKER!)).toBe(true);
+        });
+      `,
+    });
+    const { stderr, exitCode } = await runTests(String(dir), args, ["./a-leak.test.ts", "./b-wait.test.ts"], {
+      ...bunEnv,
+      ...env,
+      MARKER: join(String(dir), "marker"),
+    });
+    expect(stderr).toContain("# Unhandled error between tests");
+    expect(stderr).toContain("error: thrown by a-leak after it finished");
+    expect(normalizeBunSnapshot(stderr, dir)).toContain("2 pass");
+    expect(normalizeBunSnapshot(stderr, dir)).toContain("1 error");
+    expect(exitCode).toBe(1);
+  });
+
+  // The swap closes the finished file's sockets after that file has exited, so
+  // a close handler that throws does so with no file active. That error was
+  // printed but never counted.
+  test.each([
+    ["--isolate", ["--isolate"], {}],
+    ["--parallel worker", ["--parallel=2"], { BUN_TEST_PARALLEL_SCALE_MS: "60000" }],
+  ])("a throw while the swap closes a finished file's sockets fails the run (%s)", async (_, args, env) => {
+    using dir = tempDir("isolate-swap-throw", {
+      "a-sockets.test.ts": `
+        import { test, expect } from "bun:test";
+        test("leave a connected socket pair whose close handlers throw", async () => {
+          const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: {
+            data() {},
+            close() { throw new Error("server close handler threw"); },
+          }});
+          const { promise: opened, resolve } = Promise.withResolvers<void>();
+          await Bun.connect({ hostname: "127.0.0.1", port: server.port, socket: {
+            data() {},
+            open() { resolve(); },
+            close() { throw new Error("client close handler threw"); },
+          }});
+          await opened;
+          expect(server.port).toBeGreaterThan(0);
+        });
+      `,
+      "b-observer.test.ts": fixtures["b-observer.test.ts"],
+    });
+    const { stderr, exitCode } = await runTests(String(dir), args, ["./a-sockets.test.ts", "./b-observer.test.ts"], {
+      ...bunEnv,
+      ...env,
+    });
+    expect(stderr).toContain("# Unhandled error between tests");
+    expect(stderr).toContain("error: server close handler threw");
+    expect(stderr).toContain("error: client close handler threw");
+    expect(normalizeBunSnapshot(stderr, dir)).toContain("2 pass");
+    expect(normalizeBunSnapshot(stderr, dir)).toContain("2 errors");
+    expect(exitCode).toBe(1);
+  });
 });
 
 // --isolate raises JSC's FTL warm-up threshold. JSC options are set once per

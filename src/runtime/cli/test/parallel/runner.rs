@@ -508,6 +508,11 @@ struct WorkerLoop<'a> {
     reporter: &'a mut CommandLineReporter,
     vm: *mut VirtualMachine,
     cmds: WorkerCommands,
+    /// `unhandled_errors_between_tests` already reported to the coordinator.
+    /// Errors can land while no file runs (work a finished file left behind),
+    /// so each FileDone carries everything since the previous one, and the
+    /// exit-time RepeatBufs frame carries the rest.
+    unhandled_sent: u32,
 }
 
 impl<'a> WorkerLoop<'a> {
@@ -566,7 +571,6 @@ impl<'a> WorkerLoop<'a> {
             self.cmds.send(wf.finish());
 
             let before = *self.reporter.summary();
-            let before_unhandled = self.reporter.jest.unhandled_errors_between_tests;
             let started_ns =
                 bun_core::Timespec::now(bun_core::TimespecMockMode::ForceRealTime).ns();
 
@@ -599,6 +603,7 @@ impl<'a> WorkerLoop<'a> {
                 .saturating_sub(started_ns);
 
             let after = *self.reporter.summary();
+            let unhandled = self.reporter.jest.unhandled_errors_between_tests;
             wf.begin(frame::Kind::FileDone);
             for v in [
                 idx,
@@ -609,12 +614,13 @@ impl<'a> WorkerLoop<'a> {
                 after.expectations - before.expectations,
                 after.skipped_because_label - before.skipped_because_label,
                 after.files - before.files,
-                self.reporter.jest.unhandled_errors_between_tests - before_unhandled,
+                unhandled - self.unhandled_sent,
             ] {
                 wf.u32(v);
             }
             wf.u64(elapsed_ns);
             self.cmds.send(wf.finish());
+            self.unhandled_sent = unhandled;
         }
     }
 }
@@ -658,10 +664,11 @@ pub(crate) fn run_as_worker(
             pending_path: Vec::new(),
             done: false,
         },
+        unhandled_sent: 0,
     };
     vm_ref.run_with_api_lock(|| wloop.begin());
 
-    worker_flush_aggregates(wloop.reporter, vm_ref, ctx, &mut wloop.cmds);
+    worker_flush_aggregates(wloop.reporter, vm_ref, ctx, &mut wloop.cmds, wloop.unhandled_sent);
     // Drain any backpressure-buffered frames before exit so the coordinator
     // sees repeat_bufs / coverage_file.
     while wloop.cmds.channel.has_pending_writes() && !wloop.cmds.channel.done.get() {
@@ -694,6 +701,7 @@ fn worker_flush_aggregates(
     vm: &mut VirtualMachine,
     ctx: &Command::ContextData,
     cmds: &mut WorkerCommands,
+    unhandled_sent: u32,
 ) {
     // Snapshots flush lazily when the next file opens its snapshot file; the
     // last file each worker ran has no successor to trigger that.
@@ -709,6 +717,7 @@ fn worker_flush_aggregates(
     wf.str(reporter.failures_to_repeat_buf.as_slice());
     wf.str(reporter.skips_to_repeat_buf.as_slice());
     wf.str(reporter.todos_to_repeat_buf.as_slice());
+    wf.u32(reporter.jest.unhandled_errors_between_tests - unhandled_sent);
     cmds.send(wf.finish());
 
     if ctx.test_options.coverage.enabled {

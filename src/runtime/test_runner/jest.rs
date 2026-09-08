@@ -596,7 +596,11 @@ pub(crate) mod on_unhandled_rejection {
         global_object: &JSGlobalObject,
         rejection: JSValue,
     ) {
-        if let Some(buntest_strong) = bun_test::clone_active_strong() {
+        // Reported against a global that the `--isolate` swap already replaced:
+        // work a finished file left running threw or rejected. The active file
+        // did not cause it, so it is counted between tests instead.
+        let from_finished_file = global_object.is_retired_for_test_isolation();
+        if !from_finished_file && let Some(buntest_strong) = bun_test::clone_active_strong() {
             // `buntest_strong` released by Rc drop.
             // SAFETY: single-threaded JS VM; `buntest_strong` is the only handle
             // dereferenced for this scope and is dropped before `BunTest::run`
@@ -649,7 +653,22 @@ pub(crate) mod on_unhandled_rejection {
         let exception_list = jsc_vm
             .on_unhandled_rejection_exception_list
             .map(|p| unsafe { &mut *p.as_ptr() });
+        let Some(runner) = Jest::runner() else {
+            jsc_vm.run_error_handler(rejection, exception_list);
+            return;
+        };
+        // Either the error belongs to a finished file, or no file is active:
+        // the `--isolate` swap is closing the finished file's handles, or a
+        // `--parallel` worker is waiting for its next file. It fails the run.
+        runner.unhandled_errors_between_tests += 1;
+        runner.bun_test_root.on_before_print();
+        bun_core::pretty_errorln!(
+            "<r>\n<b><d>#<r> <red><b>Unhandled error<r><d> between tests<r>\n<d>-------------------------------<r>\n",
+        );
+        Output::flush();
         jsc_vm.run_error_handler(rejection, exception_list);
+        bun_core::pretty_error!("<r><d>-------------------------------<r>\n\n");
+        Output::flush();
     }
 }
 

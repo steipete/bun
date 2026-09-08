@@ -806,6 +806,10 @@ public:
     Ref<NapiEnv> makeNapiEnv(const napi_module&);
     napi_env makeNapiEnvForFFI();
     void adoptNapiEnvsForTestIsolation(GlobalObject* oldGlobal);
+    void adoptRejectedPromisesForTestIsolation(GlobalObject* oldGlobal);
+    // Set by the `bun test --isolate` per-file swap on the global it replaces. Promises of this
+    // realm can still reject afterwards; they report to the current global (promiseRejectionTracker).
+    bool isRetiredForTestIsolation = false;
 
 private:
     DOMGuardedObjectSet m_guardedObjects WTF_GUARDED_BY_LOCK(m_gcLock);

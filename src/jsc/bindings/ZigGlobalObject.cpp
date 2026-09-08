@@ -685,6 +685,8 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__createForTestIsolation(Zig::G
     // into the dead cell via NapiHandleScope::open. Point those envs at the
     // new global and adopt the refs before unprotecting the old one.
     globalObject->adoptNapiEnvsForTestIsolation(oldGlobal);
+    oldGlobal->isRetiredForTestIsolation = true;
+    globalObject->adoptRejectedPromisesForTestIsolation(oldGlobal);
 
     // The swap replaces this thread's ScriptExecutionContext. If the thread had
     // joined a worker_threads SHARE_ENV tree, carry it over (store + the
@@ -710,6 +712,12 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__createForTestIsolation(Zig::G
     JSC::gcUnprotect(oldGlobal);
 
     return globalObject;
+}
+
+extern "C" bool Zig__GlobalObject__isRetiredForTestIsolation(JSC::JSGlobalObject* globalObject)
+{
+    auto* zigGlobal = dynamicDowncast<Zig::GlobalObject>(globalObject);
+    return zigGlobal && zigGlobal->isRetiredForTestIsolation;
 }
 
 static bool isModuleEvaluated(JSC::AbstractModuleRecord* record)
@@ -1090,6 +1098,13 @@ void GlobalObject::promiseRejectionTracker(JSGlobalObject* obj, JSC::JSPromise* 
     JSC::JSPromiseRejectionOperation operation)
 {
     auto* globalObj = static_cast<GlobalObject*>(obj);
+    // The event loop only drains the current global's list (handleRejectedPromises). A promise
+    // whose realm is a global that `bun test --isolate` already swapped out reports there instead,
+    // the same way node:vm contexts report to their parent.
+    if (globalObj->isRetiredForTestIsolation) [[unlikely]] {
+        if (auto* current = defaultGlobalObject())
+            globalObj = current;
+    }
 
     switch (operation) {
     case JSPromiseRejectionOperation::Reject:
@@ -3283,7 +3298,12 @@ void GlobalObject::handleRejectedPromises()
                 continue;
             inflight.index = i + 1;
 
-            Bun__handleRejectedPromise(this, promise);
+            // A promise forwarded from a realm that `bun test --isolate` retired is reported
+            // against that realm, so the runner can tell it apart from the running file's errors.
+            auto* reportingGlobal = this;
+            if (auto* realm = dynamicDowncast<Zig::GlobalObject>(promise->globalObject()); realm && realm->isRetiredForTestIsolation)
+                reportingGlobal = realm;
+            Bun__handleRejectedPromise(reportingGlobal, promise);
             if (auto ex = scope.exception()) {
                 if (virtual_machine.isTerminationException(ex)) [[unlikely]]
                     return;
@@ -4254,6 +4274,20 @@ void GlobalObject::adoptNapiEnvsForTestIsolation(GlobalObject* oldGlobal)
     // element out, and we make the source explicitly empty afterwards so
     // ~GlobalObject on the old cell is a no-op here.
     m_napiEnvs.appendVector(std::exchange(oldGlobal->m_napiEnvs, {}));
+}
+
+// Unhandled rejections the old realm collected since the event loop last drained it (the
+// teardown between files runs close handlers and microtasks). Nothing drains the old global's
+// list after the swap, so move them to this one.
+void GlobalObject::adoptRejectedPromisesForTestIsolation(GlobalObject* oldGlobal)
+{
+    if (oldGlobal->m_aboutToBeNotifiedRejectedPromises.isEmpty())
+        return;
+    JSC::MarkedArgumentBuffer pending;
+    oldGlobal->m_aboutToBeNotifiedRejectedPromises.drainTo(oldGlobal, pending);
+    RELEASE_ASSERT(!pending.hasOverflowed());
+    for (size_t i = 0, size = pending.size(); i < size; ++i)
+        m_aboutToBeNotifiedRejectedPromises.append(vm(), this, static_cast<JSC::JSPromise*>(pending.at(i).asCell()));
 }
 
 void GlobalObject::setNodeWorkerEnvironmentData(JSMap* data) { m_nodeWorkerEnvironmentData.set(vm(), this, data); }
