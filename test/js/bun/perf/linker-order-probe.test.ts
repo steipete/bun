@@ -13,10 +13,10 @@ import {
   HUNG_BATCH,
   childrenOf,
   closeAuditSource,
-  readCloseAudit,
   describeSelf,
   describeTree,
   probeTracerSource,
+  readCloseAudit,
   run,
   runHungBatchRounds,
 } from "./functrace-probe-helpers.ts";
