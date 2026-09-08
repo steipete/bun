@@ -12,6 +12,7 @@ const {
   fsEisdirError,
   areIdentical,
   isSrcSubdir,
+  joinDirEntry,
 } = require("internal/fs/cp-sync");
 
 const {
@@ -27,7 +28,7 @@ const {
   unlink,
   utimes,
 } = require("node:fs/promises");
-const { dirname, isAbsolute, join, parse, resolve } = require("node:path");
+const { dirname, isAbsolute, parse, resolve } = require("node:path");
 
 const PromisePrototypeThen = $Promise.prototype.$then;
 const PromiseReject = Promise.$reject;
@@ -139,7 +140,7 @@ async function treeContainsOnlyFilesAndDirs(root) {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       if (entry.isDirectory()) {
-        stack.push(join(dir, entry.name));
+        stack.push(joinDirEntry(dir, entry.name));
       } else if (!entry.isFile()) {
         return false;
       }
@@ -338,8 +339,8 @@ async function copyDir(src, dest, opts) {
   const dir = await opendir(src);
 
   for await (const { name } of dir) {
-    const srcItem = join(src, name);
-    const destItem = join(dest, name);
+    const srcItem = joinDirEntry(src, name);
+    const destItem = joinDirEntry(dest, name);
     const { destStat, skipped } = await checkPaths(srcItem, destItem, opts);
     if (!skipped) await getStatsForCopy(destStat, srcItem, destItem, opts);
   }

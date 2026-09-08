@@ -1125,6 +1125,22 @@ it("Dirent has the expected fields", () => {
   expect(dirs[0].parentPath).toBe(dir);
 });
 
+it("recursive readdir reports the caller's path, as given, as the parentPath of root entries", async () => {
+  using dir = tempDir("readdir-parentPath", { "a.txt": "", "sub/b.txt": "" });
+  // Node hands root entries the path string untouched and nested entries
+  // path.join(root, subdir), so only the nested ones come back normalized.
+  for (const root of [`${dir}${path.sep}sub${path.sep}..`, `${dir}${path.sep}`, `${dir}${path.sep}.${path.sep}`]) {
+    const expected = [
+      [root, "a.txt"],
+      [path.join(root, "sub"), "b.txt"],
+      [root, "sub"],
+    ];
+    const pairs = (ents: Dirent[]) => ents.map(e => [e.parentPath, e.name]).sort((a, b) => a[1].localeCompare(b[1]));
+    expect(pairs(readdirSync(root, { recursive: true, withFileTypes: true }))).toEqual(expected);
+    expect(pairs(await promises.readdir(root, { recursive: true, withFileTypes: true }))).toEqual(expected);
+  }
+});
+
 it("promises.readdir on a large folder", async () => {
   const huge = tmpdirSync();
   for (let i = 0; i < 128; i++) {

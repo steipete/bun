@@ -301,6 +301,26 @@ for (const [name, copy] of impls) {
       });
     });
 
+    // The kernel resolves `link/..` through the symlink. Folding it lexically
+    // (`path.join`) names a different directory than the one readdir listed.
+    test.skipIf(isWindows)("recursive - children of a `symlink/..` source come from the listed directory", async () => {
+      await using basename = tempDir("cp", {
+        "app/config.json": "lexical",
+        "releases/config.json": "kernel",
+        "releases/v2/marker.txt": "v2",
+      });
+      // app/cur -> ../releases/v2, so app/cur/.. is releases/, not app/.
+      fs.symlinkSync(join("..", "releases", "v2"), join(basename, "app", "cur"));
+      const src = basename + "/app/cur/..";
+      expect(fs.readdirSync(src).sort()).toEqual(["config.json", "v2"]);
+
+      await copy(src, basename + "/backup", { recursive: true });
+
+      expect(fs.readdirSync(basename + "/backup").sort()).toEqual(["config.json", "v2"]);
+      assertContent(basename + "/backup/config.json", "kernel");
+      assertContent(basename + "/backup/v2/marker.txt", "v2");
+    });
+
     test.skipIf(isWindows)("recursive - FIFO inside the tree is rejected with ERR_FS_CP_FIFO_PIPE", async () => {
       await using basename = tempDir("cp", {
         "from/a.txt": "a",

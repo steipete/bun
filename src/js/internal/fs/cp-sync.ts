@@ -157,6 +157,16 @@ function isSrcSubdir(src, dest) {
   return ArrayPrototypeEvery.$call(srcArr, (cur, i) => destArr[i] === cur);
 }
 
+// The path of an entry that readdir(dir) just listed. On POSIX the kernel
+// resolves `link/..` through the symlink, so `path.join`, which folds `..`
+// lexically, can name a different directory than the one that was listed.
+// Win32 folds `..` lexically itself before the filesystem sees the path, so
+// `join` is exact there and keeps the separators uniform.
+const joinDirEntry: (dir: string, name: string) => string =
+  process.platform === "win32"
+    ? join
+    : (dir, name) => (dir.charCodeAt(dir.length - 1) === 0x2f /* '/' */ ? dir + name : dir + "/" + name);
+
 function checkPathsSync(src, dest, opts) {
   if (opts.filter) {
     const shouldCopy = opts.filter(src, dest);
@@ -267,7 +277,7 @@ function treeContainsOnlyFilesAndDirsSync(root) {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       if (entry.isDirectory()) {
-        stack.push(join(dir, entry.name));
+        stack.push(joinDirEntry(dir, entry.name));
       } else if (!entry.isFile()) {
         return false;
       }
@@ -444,8 +454,8 @@ function mkDirAndCopy(srcMode, src, dest, opts) {
 function copyDir(src, dest, opts) {
   for (const dirent of readdirSync(src, { withFileTypes: true })) {
     const { name } = dirent;
-    const srcItem = join(src, name);
-    const destItem = join(dest, name);
+    const srcItem = joinDirEntry(src, name);
+    const destItem = joinDirEntry(dest, name);
     const { destStat, skipped } = checkPathsSync(srcItem, destItem, opts);
     if (!skipped) getStats(destStat, srcItem, destItem, opts);
   }
@@ -523,4 +533,5 @@ export default {
   fsEisdirError,
   areIdentical,
   isSrcSubdir,
+  joinDirEntry,
 };

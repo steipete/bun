@@ -6278,9 +6278,20 @@ impl NodeFS {
         });
 
         let mut iterator = DirIterator::WrappedIterator::init(fd);
-        let mut dirent_path_prev = BunString::EMPTY;
         let mut spill: Vec<u8> = Vec::new();
-        let mut dirent_spill: Vec<u8> = Vec::new();
+        // `parentPath` of every entry in this directory. Root entries report
+        // the caller's path as given, deeper ones the normalized join, the
+        // same split as node's `path.join(parent, name)` walker.
+        let dirent_path = if !T::IS_DIRENT {
+            BunString::EMPTY
+        } else if is_root {
+            BunString::clone_utf8(root_basename)
+        } else {
+            BunString::clone_utf8(paths::resolve_path::join_spill::<paths::platform::Auto>(
+                &mut spill,
+                &[root_basename, basename.as_bytes()],
+            ))
+        };
 
         loop {
             let current = match iterator.next() {
@@ -6360,22 +6371,12 @@ impl NodeFS {
                 }
             }
 
-            if T::IS_DIRENT {
-                let joined = paths::resolve_path::join_spill::<paths::platform::Auto>(
-                    &mut dirent_spill,
-                    &[root_basename, name_to_copy],
-                );
-                let path_u8 = paths::resolve_path::dirname::<paths::platform::Auto>(joined);
-                if dirent_path_prev.is_empty() || dirent_path_prev.byte_slice() != path_u8 {
-                    dirent_path_prev = BunString::clone_utf8(path_u8);
-                }
-            }
             // async path: uses raw `BunString::clone_utf8` — do not apply encoding.
             T::append_entry_recursive(
                 entries,
                 utf8_name,
                 name_to_copy,
-                &dirent_path_prev,
+                &dirent_path,
                 effective_kind,
                 async_task.encoding,
                 false,
@@ -6469,7 +6470,25 @@ impl NodeFS {
             });
 
             let mut iterator = DirIterator::WrappedIterator::init(fd);
-            let mut dirent_path_prev = BunString::DEAD;
+            // `parentPath` of every entry in this directory. Root entries report
+            // the caller's path as given, deeper ones the normalized join, the
+            // same split as node's `path.join(parent, name)` walker.
+            let dirent_path = if !T::IS_DIRENT {
+                BunString::EMPTY
+            } else {
+                let path_u8: &[u8] = if is_root {
+                    root_basename.as_bytes()
+                } else {
+                    paths::resolve_path::join_spill::<paths::platform::Auto>(
+                        &mut dirent_spill,
+                        &[root_basename.as_bytes(), basename_bytes],
+                    )
+                };
+                webcore::encoding::to_bun_string(
+                    without_nt_prefix::<u8>(path_u8),
+                    encoding_to_node(args.encoding),
+                )
+            };
 
             loop {
                 let current = match iterator.next() {
@@ -6533,25 +6552,12 @@ impl NodeFS {
                     }
                 }
 
-                if T::IS_DIRENT {
-                    let joined = paths::resolve_path::join_spill::<paths::platform::Auto>(
-                        &mut dirent_spill,
-                        &[root_basename.as_bytes(), name_to_copy],
-                    );
-                    let path_u8 = paths::resolve_path::dirname::<paths::platform::Auto>(joined);
-                    if dirent_path_prev.is_empty() || dirent_path_prev.byte_slice() != path_u8 {
-                        dirent_path_prev = webcore::encoding::to_bun_string(
-                            without_nt_prefix::<u8>(path_u8),
-                            encoding_to_node(args.encoding),
-                        );
-                    }
-                }
                 // sync path: uses `webcore::encoding::to_bun_string(.., args.encoding)`.
                 T::append_entry_recursive(
                     entries,
                     utf8_name,
                     name_to_copy,
-                    &dirent_path_prev,
+                    &dirent_path,
                     effective_kind,
                     args.encoding,
                     true,
