@@ -265,6 +265,10 @@ impl<'a> Options<'a> {
             hasher.update(b"udfcf=0");
         }
 
+        // Byte-identical sources transpile differently per `module_type`: the
+        // top-level `this` substitution and `exports_kind` both read it.
+        hasher.update(&[self.module_type as u8]);
+
         self.features.hash_for_runtime_transpiler(hasher);
     }
 

@@ -252,3 +252,59 @@ describe("unterminated string literals in large files", () => {
     expect(exitCode).toBe(1);
   });
 });
+
+// https://github.com/oven-sh/bun/issues/32167
+describe.concurrent("top-level this", () => {
+  const logThis = `console.log(typeof this, this === undefined);\n`;
+  // .mjs and "type": "module" make the file an ES module even with no import/export syntax.
+  const esmFiles = {
+    "import-only.js": `import { EventEmitter } from "node:events";
+const emitter = new EventEmitter();
+emitter.on("event", () => {
+  console.log(typeof this, this === undefined);
+});
+emitter.emit("event");
+`,
+    "export-only.mjs": `export {};\n` + logThis,
+    "bare.mjs": logThis,
+    "type-module/package.json": `{ "type": "module" }`,
+    "type-module/bare.js": logThis,
+  };
+
+  for (const file of ["import-only.js", "export-only.mjs", "bare.mjs", "type-module/bare.js"]) {
+    test(`is undefined in an ES module: ${file}`, async () => {
+      using dir = tempDir("esm-top-level-this", esmFiles);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), file],
+        env: bunEnv,
+        cwd: String(dir),
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout, stderr }).toEqual({ stdout: "undefined true\n", stderr: "" });
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  test("is module.exports in a CommonJS module", async () => {
+    using dir = tempDir("cjs-top-level-this", {
+      "cjs.js": `console.log(this === module.exports, JSON.stringify(this));`,
+      "bare.cjs": `console.log(typeof this, JSON.stringify(this));`,
+    });
+
+    for (const [file, expected] of [
+      ["cjs.js", "true {}\n"],
+      ["bare.cjs", "object {}\n"],
+    ]) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), file],
+        env: bunEnv,
+        cwd: String(dir),
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ file, stdout, stderr }).toEqual({ file, stdout: expected, stderr: "" });
+      expect(exitCode).toBe(0);
+    }
+  });
+});

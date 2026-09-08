@@ -123,6 +123,26 @@ describe("transpiler cache", () => {
     expect(await bunRun(join(temp_dir, "main.js"), env)).toSpawn(expected);
     expect(!existsSync(cache_dir)).toBeTrue();
   });
+  test("byte-identical files with different package.json types do not share entries", async () => {
+    // https://github.com/oven-sh/bun/issues/32167
+    // Top-level `this` is `undefined` in an ES module and `exports` in CommonJS,
+    // so `module_type` (package.json "type" / file extension) must be part of
+    // the cache key.
+    const data = dummyFile(50 * 1024, "1", { code: "typeof this, this === undefined" });
+    mkdirSync(join(temp_dir, "esm"));
+    mkdirSync(join(temp_dir, "cjs"));
+    writeFileSync(join(temp_dir, "esm", "package.json"), '{ "type": "module" }');
+    writeFileSync(join(temp_dir, "cjs", "package.json"), '{ "type": "commonjs" }');
+    writeFileSync(join(temp_dir, "esm", "a.js"), data);
+    writeFileSync(join(temp_dir, "cjs", "a.js"), data);
+
+    expect(await bunRun(join(temp_dir, "esm", "a.js"), env)).toSpawn("undefined true");
+    expect(newCacheCount()).toBe(1);
+    // Same bytes in a CommonJS package must not be served the cached ES module output.
+    expect(await bunRun(join(temp_dir, "cjs", "a.js"), env)).toSpawn("object false");
+    // And the reverse direction, now that the CommonJS output was written last.
+    expect(await bunRun(join(temp_dir, "esm", "a.js"), env)).toSpawn("undefined true");
+  });
   test("it is indeed content addressable", async () => {
     writeFileSync(join(temp_dir, "a.js"), dummyFile(50 * 1024, "1", "b"));
     expect(await bunRun(join(temp_dir, "a.js"), env)).toSpawn("b");
