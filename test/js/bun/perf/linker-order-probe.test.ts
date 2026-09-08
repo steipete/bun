@@ -5,7 +5,7 @@
 // test file inside a small `bun test --parallel` batch, and prints where a run
 // that stops making progress is stuck. It asserts only that no run hung.
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isLinux, isMusl, tempDir } from "harness";
+import { bunEnv, isLinux, isMusl, tempDir } from "harness";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { readTextSymbols } from "../../../../scripts/orderfile/generate.ts";
