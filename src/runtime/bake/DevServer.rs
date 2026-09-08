@@ -5806,6 +5806,24 @@ impl DevServer {
                     unsafe { &mut *ev_ptr }.append_file(file_path);
                 }
                 bun_watcher::Kind::Directory => {
+                    // A directory below this one that was replaced (renamed over,
+                    // or removed and created again) leaves every watch at or below
+                    // it on the old inode. Evict that subtree so the next bundle
+                    // re-arms it, and hand its files to the incremental graph as
+                    // changed so the bundle happens.
+                    #[cfg(not(windows))]
+                    let stale_ev_ptr: *mut HotReloadEvent = ev_ptr;
+                    #[cfg(not(windows))]
+                    let mut on_stale =
+                        move |kind: bun_watcher::Kind, path: &[u8], _: bun_watcher::HashType| {
+                            // SAFETY: see `ev_ptr` above; call-scoped borrow.
+                            let ev = unsafe { &mut *stale_ev_ptr };
+                            match kind {
+                                bun_watcher::Kind::File => ev.append_file(path),
+                                bun_watcher::Kind::Directory => ev.append_dir(path, None),
+                            }
+                        };
+
                     // Note: `target_os = "linux"` is false on Android, so
                     // include `target_os = "android"` explicitly to
                     // keep forwarding inotify sub-path names there.
@@ -5814,10 +5832,31 @@ impl DevServer {
                         // INotifyWatcher stores sub paths into `changed_files`
                         let names = event.names(changed_files);
                         if !names.is_empty() {
+                            let replaced = event
+                                .op
+                                .intersects(bun_watcher::Op::CREATE | bun_watcher::Op::MOVE_TO);
+                            let dir = bun_core::strings::trim_right(file_path, &[bun_paths::SEP]);
+                            let mut child_buf = bun_paths::path_buffer_pool::get();
                             for maybe_sub_path in names {
                                 // SAFETY: see `ev_ptr` above; call-scoped borrow.
                                 unsafe { &mut *ev_ptr }
                                     .append_dir(file_path, maybe_sub_path.map(|s| s.as_bytes()));
+
+                                let Some(name) = maybe_sub_path.map(|s| s.as_bytes()) else {
+                                    continue;
+                                };
+                                let child_len = dir.len() + 1 + name.len();
+                                if !replaced || name.is_empty() || child_len > child_buf.len() {
+                                    continue;
+                                }
+                                child_buf[..dir.len()].copy_from_slice(dir);
+                                child_buf[dir.len()] = bun_paths::SEP;
+                                child_buf[dir.len() + 1..child_len].copy_from_slice(name);
+                                let child = &child_buf[..child_len];
+                                if self.bun_watcher.remove_path_and_descendants(child, &mut on_stale) > 0 {
+                                    // SAFETY: see `ev_ptr` above; call-scoped borrow.
+                                    unsafe { &mut *ev_ptr }.append_dir(child, None);
+                                }
                             }
                         } else {
                             // SAFETY: see `ev_ptr` above; call-scoped borrow.
@@ -5829,6 +5868,10 @@ impl DevServer {
                         let _ = changed_files;
                         // SAFETY: see `ev_ptr` above; call-scoped borrow.
                         unsafe { &mut *ev_ptr }.append_dir(file_path, None);
+                        #[cfg(not(windows))]
+                        if event.op.contains(bun_watcher::Op::WRITE) {
+                            self.bun_watcher.remove_replaced_descendants(event.index, &mut on_stale);
+                        }
                     }
                 }
             }
