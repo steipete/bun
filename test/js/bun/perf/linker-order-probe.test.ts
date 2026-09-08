@@ -12,6 +12,8 @@ import { readTextSymbols } from "../../../../scripts/orderfile/generate.ts";
 import {
   HUNG_BATCH,
   childrenOf,
+  closeAuditSource,
+  readCloseAudit,
   describeSelf,
   describeTree,
   probeTracerSource,
@@ -47,6 +49,7 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
     dirHandle = tempDir("functrace-probe", {
       "child.c": "int main(void) { return 0; }\n",
       "functrace-probe.c": probeTracerSource(readFileSync(join(orderfile, "functrace.c"), "utf8")),
+      "closeaudit.c": closeAuditSource,
       "ctr.c": [
         "#include <stdio.h>",
         "#include <unistd.h>",
@@ -72,6 +75,7 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
       compile(["-o", fixture, join(import.meta.dir, "functrace-fixture.c")]),
       compile(["-o", child, join(root, "child.c")]),
       compile(["-o", join(root, "ctr"), join(root, "ctr.c")]),
+      compile(["-shared", "-fPIC", "-o", join(root, "closeaudit.so"), join(root, "closeaudit.c"), "-ldl"]),
     ]);
     console.log(`compiles: ${(performance.now() - t0).toFixed(0)} ms with ${compiler}`);
     const symbols = readTextSymbols(fixture);
@@ -309,10 +313,12 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
       let stalls = 0;
       const t0 = performance.now();
       for (let round = 0; round < rounds && stalls < 2; round++) {
+        const auditLog = join(dir, `closeaudit.${round}.log`);
         await using proc = Bun.spawn({
           cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...files, ...neighbors],
           cwd: repo,
-          env: bunEnv,
+          // The coordinator and its workers run under the close auditor.
+          env: { ...bunEnv, LD_PRELOAD: join(root, "closeaudit.so"), CLOSEAUDIT_LOG: auditLog },
           stdout: "pipe",
           stderr: "pipe",
         });
@@ -321,7 +327,11 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
         const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
         const bad = /STALLED|timed out|REPEAT trap/.test(out);
         const { repeats } = repeatsIn(join(dir, "diag.txt"));
-        console.log(`round ${round}: ${cases} cases, ${summary}, ${repeats} repeat traps${bad ? " BAD" : ""}`);
+        const audit = await readCloseAudit(auditLog, bunExe());
+        console.log(
+          `round ${round}: ${cases} cases, ${summary}, ${repeats} repeat traps, ${audit ? audit.split("\n").filter(l => l.includes("EBADF pid")).length + " EBADF closes" : "no EBADF closes"}${bad ? " BAD" : ""}`,
+        );
+        if (audit) console.log(audit.split("\n").slice(0, 120).join("\n"));
         if (bad) {
           stalls++;
           console.error(

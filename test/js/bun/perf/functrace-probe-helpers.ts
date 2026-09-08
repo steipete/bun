@@ -90,6 +90,164 @@ export async function run(cmd: string[]): Promise<string> {
 }
 
 /**
+ * An LD_PRELOAD library for the bun worker processes: reports every close()
+ * or syscall(SYS_close) that fails with EBADF, i.e. a second close of an fd
+ * number. When the number was reused in between, the same bug closes someone
+ * else's fd instead, which is what a pipe reader that never sees EOF would
+ * look like. Frames inside the executable are printed as exe+0xoffset so
+ * they can be symbolized against the same binary.
+ */
+export const closeAuditSource = String.raw`
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static int log_fd = -1;
+static unsigned long n_close = 0, n_ebadf = 0;
+static char exe[512];
+static unsigned long exe_lo = 0, exe_hi = 0;
+static long (*real_syscall)(long, ...);
+static int (*real_close)(int);
+
+static void emit(const char *fmt, ...)
+{
+    if (log_fd < 0) return;
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
+    if (n > 0) (void)!real_syscall(SYS_write, (long)log_fd, buf, (long)n, 0L, 0L, 0L);
+}
+
+__attribute__((constructor)) static void audit_init(void)
+{
+    real_syscall = dlsym(RTLD_NEXT, "syscall");
+    real_close = dlsym(RTLD_NEXT, "close");
+    const char *path = getenv("CLOSEAUDIT_LOG");
+    if (!path) return;
+    ssize_t k = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (k > 0) exe[k] = 0;
+    /* Only audit bun itself; compilers and fixtures inherit the preload too. */
+    const char *base = strrchr(exe, '/');
+    if (!base || strncmp(base + 1, "bun", 3) != 0) return;
+    int fd = (int)real_syscall(SYS_openat, (long)AT_FDCWD, path, (long)(O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC), 0644L);
+    if (fd < 0) return;
+    int hi = (int)real_syscall(SYS_fcntl, (long)fd, (long)F_DUPFD_CLOEXEC, 900L);
+    if (hi >= 0) { real_syscall(SYS_close, (long)fd); fd = hi; }
+    log_fd = fd;
+    FILE *maps = fopen("/proc/self/maps", "re");
+    if (maps) {
+        char line[1024];
+        while (fgets(line, sizeof line, maps)) {
+            unsigned long lo, hi2;
+            char perms[8], file[768];
+            file[0] = 0;
+            if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %767[^\n]", &lo, &hi2, perms, file) >= 3 && strcmp(file, exe) == 0) {
+                if (!exe_lo || lo < exe_lo) exe_lo = lo;
+                if (hi2 > exe_hi) exe_hi = hi2;
+            }
+        }
+        fclose(maps);
+    }
+}
+
+__attribute__((destructor)) static void audit_fini(void)
+{
+    if (n_ebadf) emit("closeaudit: SUMMARY pid %d closes=%lu EBADF=%lu exe %s\n", (int)getpid(), n_close, n_ebadf, exe);
+}
+
+static void report(const char *via, int fd)
+{
+    __atomic_fetch_add(&n_ebadf, 1, __ATOMIC_RELAXED);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    void *frames[40];
+    int n = backtrace(frames, 40);
+    char trace[2048];
+    int len = 0;
+    trace[0] = 0;
+    for (int i = 1; i < n && len < (int)sizeof trace - 40; i++) {
+        unsigned long a = (unsigned long)frames[i];
+        if (a >= exe_lo && a < exe_hi) len += snprintf(trace + len, sizeof trace - len, " exe+%#lx", a - exe_lo);
+        else len += snprintf(trace + len, sizeof trace - len, " %#lx", a);
+    }
+    emit("closeaudit: EBADF pid %d tid %ld t=%ld.%06ld %s(%d) base=%#lx frames:%s\n", (int)getpid(), (long)real_syscall(SYS_gettid),
+         (long)ts.tv_sec, ts.tv_nsec / 1000, via, fd, exe_lo, trace);
+}
+
+int close(int fd)
+{
+    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
+    if (log_fd >= 0 && fd == log_fd) { report("close-of-audit-log", fd); return 0; }
+    int rc = real_close(fd);
+    int err = errno;
+    __atomic_fetch_add(&n_close, 1, __ATOMIC_RELAXED);
+    if (rc != 0 && err == EBADF && log_fd >= 0) report("close", fd);
+    errno = err;
+    return rc;
+}
+
+long syscall(long number, ...)
+{
+    va_list ap;
+    va_start(ap, number);
+    long a = va_arg(ap, long), b = va_arg(ap, long), c = va_arg(ap, long), d = va_arg(ap, long), e = va_arg(ap, long), f = va_arg(ap, long);
+    va_end(ap);
+    if (!real_syscall) real_syscall = dlsym(RTLD_NEXT, "syscall");
+    if (number == SYS_close) {
+        if (log_fd >= 0 && (int)a == log_fd) { report("sys_close-of-audit-log", (int)a); return 0; }
+        long rc = real_syscall(number, a);
+        int err = errno;
+        __atomic_fetch_add(&n_close, 1, __ATOMIC_RELAXED);
+        if (rc != 0 && err == EBADF && log_fd >= 0) report("sys_close", (int)a);
+        errno = err;
+        return rc;
+    }
+    if (number == SYS_close_range && log_fd > 2) {
+        unsigned lo = (unsigned)a, hi = (unsigned)b;
+        if ((unsigned)log_fd >= lo && (unsigned)log_fd <= hi) {
+            long rc = 0;
+            if ((unsigned)log_fd > lo) rc = real_syscall(number, (long)lo, (long)(log_fd - 1), c);
+            if ((unsigned)log_fd < hi) rc = real_syscall(number, (long)(log_fd + 1), (long)hi, c);
+            return rc;
+        }
+    }
+    return real_syscall(number, a, b, c, d, e, f);
+}
+`;
+
+/** EBADF lines from a close-audit log, with exe+0x... frames symbolized against `exe` when a symbolizer is installed. */
+export async function readCloseAudit(log: string, exe: string): Promise<string> {
+  if (!existsSync(log)) return "";
+  const text = readFileSync(log, "utf8");
+  if (!text.trim()) return "";
+  const offsets = [...new Set([...text.matchAll(/exe\+(0x[0-9a-f]+)/g)].map(m => m[1]))].slice(0, 200);
+  let symbols = "";
+  const symbolizer =
+    Bun.which("llvm-symbolizer") ||
+    ["21", "20", "19"].map(v => `/usr/lib/llvm-${v}/bin/llvm-symbolizer`).find(existsSync);
+  if (offsets.length && symbolizer) {
+    const out = await run([symbolizer, `--obj=${exe}`, "--functions=short", "--demangle", "--inlines", ...offsets]);
+    const names = out.split("\n\n");
+    symbols = offsets.map((o, i) => `  ${o}: ${(names[i] ?? "?").split("\n").slice(0, 6).join(" | ")}`).join("\n");
+  } else if (offsets.length && Bun.which("addr2line")) {
+    symbols = await run(["addr2line", "-f", "-C", "-i", "-e", exe, ...offsets]);
+  }
+  return `${text.trimEnd()}\n--- symbolized against ${exe}\n${symbols}`;
+}
+
+/**
  * The parallel batch of the shard that hung (build 111536, debian 13 aarch64),
  * file for file, minus the two napi files whose prebuilds the runner makes.
  */
@@ -239,7 +397,9 @@ export async function runHungBatchRounds(label: string, budgetMs: number): Promi
  * bun on pipes, in the same worker process at the same moment.
  */
 export async function runPtyCase(opts: { root: string; tag: string; watchdogMs?: number }): Promise<void> {
-  const { bunEnv, bunExe } = await import("harness");
+  const { bunEnv: inherited, bunExe } = await import("harness");
+  // The worker may run under the close auditor (LD_PRELOAD); its children must not.
+  const { LD_PRELOAD: _preload, CLOSEAUDIT_LOG: _log, ...bunEnv } = inherited as Record<string, string>;
   const orderfile = join(import.meta.dir, "../../../../scripts/orderfile");
   const compiler = process.env.CC || Bun.which("cc") || Bun.which("clang") || Bun.which("gcc");
   const { root, tag } = opts;
@@ -327,7 +487,8 @@ export async function runTracerCase(opts: {
   verbose?: boolean;
   watchdogMs?: number;
 }): Promise<void> {
-  const { bunEnv } = await import("harness");
+  const { bunEnv: inherited } = await import("harness");
+  const { LD_PRELOAD: _preload, CLOSEAUDIT_LOG: _log, ...bunEnv } = inherited as Record<string, string>;
   const { readTextSymbols } = await import("../../../../scripts/orderfile/generate.ts");
   const orderfile = join(import.meta.dir, "../../../../scripts/orderfile");
   const compiler = process.env.CC || Bun.which("cc") || Bun.which("clang") || Bun.which("gcc");
