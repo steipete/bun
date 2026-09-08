@@ -2,7 +2,7 @@ import { spawn } from "bun";
 import { upgrade_test_helpers } from "bun:internal-for-testing";
 import { describe, expect, it } from "bun:test";
 import { bunExe, bunEnv as env, isMusl, isWindows, tempDir, tls, tmpdirSync } from "harness";
-import { existsSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, statSync } from "node:fs";
 import { copyFile, writeFile } from "node:fs/promises";
 import { basename, join } from "path";
 const { openTempDirWithoutSharingDelete, closeTempDirHandle } = upgrade_test_helpers;
@@ -347,6 +347,45 @@ it("recreates the staging directory in the temp dir instead of reusing a pre-exi
   }
 
   // The bogus archive must not be installed; the upgrade fails cleanly.
+  expect(exitCode).toBe(1);
+});
+
+// The staging directory is created under the temp dir and the new binary is
+// unpacked and run from it by path. The owner of a directory renames any
+// entry in it whatever that entry's own mode bits say, and a group- or
+// other-writable directory gives everyone the same power unless the sticky
+// bit is set, so such a user could swap the staging directory for their own
+// between the download and the exec. Unix only: the rule is about uid and the
+// sticky bit.
+it.skipIf(isWindows)("refuses to stage the download in a temp dir that other local users can modify", async () => {
+  const tagName = "bun-v9.9.9";
+  using stagingRoot = tempDir("bun-upgrade-open-staging", {});
+  const stagingRootPath = String(stagingRoot);
+  chmodSync(stagingRootPath, 0o777);
+
+  using server = startReleaseServer({ tagName });
+
+  const cwd = tmpdirSync();
+  const execPath = join(cwd, basename(bunExe()));
+  await copyFile(bunExe(), execPath);
+
+  await using proc = Bun.spawn({
+    cmd: [execPath, "upgrade", "--stable"],
+    cwd,
+    stdout: null,
+    stdin: "pipe",
+    stderr: "pipe",
+    env: {
+      ...server.env,
+      BUN_TMPDIR: stagingRootPath,
+    },
+  });
+
+  const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+  expect(stderr).toContain("9.9.9");
+  expect(stderr).toContain("refusing to use temp directory");
+  expect(readdirSync(stagingRootPath)).toEqual([]);
   expect(exitCode).toBe(1);
 });
 
