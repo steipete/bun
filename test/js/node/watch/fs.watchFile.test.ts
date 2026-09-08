@@ -122,9 +122,11 @@ describe("fs.watchFile", () => {
     clearInterval(interval);
     fs.unwatchFile(literal);
 
-    // `a\b` holds "literal..." (7+ bytes), `a/b` holds "n." (1-2 bytes).
-    expect(prev.size).toBe("literal".length);
-    expect(curr.size).toBeGreaterThan("literal".length);
+    // `a\b` holds "literal..." (7+ bytes), `a/b` holds "n." (1-2 bytes). The
+    // first update can land before the watcher's initial stat, so `prev` may
+    // already be past 7.
+    expect(prev.size).toBeGreaterThanOrEqual("literal".length);
+    expect(curr.size).toBeGreaterThanOrEqual("literal1".length);
   });
 
   test("bigint stats", async () => {
