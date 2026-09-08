@@ -81,6 +81,10 @@ public:
     // process.nextTick job delivers it during the same microtask/nextTick drain.
     bool m_endOfTickFlushArmed : 1 { false };
     bool m_finalChunkArmed : 1 { false };
+    // The consumer takes the whole body (.text()/.json()/.blob(), readableStreamToArray): pull()
+    // runs once, and an async pull() that resolves without close()/end() has produced all of
+    // it, so its settlement closes. A reader (getReader/for-await/pipeTo/tee) pulls per read instead.
+    bool m_closeOnPullSettled : 1 { false };
 
     // ArrayBuffer sink: a real Bun.ArrayBufferSink cell (ArrayBuffer kind only).
     JSC::WriteBarrier<JSC::JSObject> m_arrayBufferSink;

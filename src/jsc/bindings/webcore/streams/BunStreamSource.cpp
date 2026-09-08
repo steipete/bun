@@ -859,9 +859,13 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
     JSValue maybePromise = call(globalObject, pull, getCallData(pull), underlyingSource, pullArgs);
     RETURN_IF_EXCEPTION(scope, {});
 
+    // The promise handed back to the native sink's owner settles when the body is complete: an async
+    // pull() that resolves without close()/end() ends the controller first (onReadDirectStreamPullFulfilled),
+    // so every sink sees the same end() it gets from an explicit close(); a sync pull() that returns
+    // without closing is waited on until something calls close()/end().
     if (auto* pullPromise = dynamicDowncast<JSPromise>(maybePromise)) {
         auto* result = JSPromise::create(vm, globalObject->promiseStructure());
-        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReturnUndefined(), jsUndefined(), result, jsUndefined());
+        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReadDirectStreamPullFulfilled(), jsUndefined(), result, state);
         return result;
     }
     if (stream->m_state == ReadableStreamState::Readable) {
@@ -1414,6 +1418,24 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundReadDirectStreamOnClose, (JSGl
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto* state = uncheckedDowncast<JSDirectSinkCloseState>(callFrame->argument(0));
     Bun::WebStreams::readDirectStreamCloseImpl(vm, globalObject, state, callFrame->argument(1), callFrame->argument(2));
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(jsUndefined());
+}
+
+// readDirectStream's pull() promise resolved. pull() runs once for a native sink, so unless it already
+// called close()/end() (readDirectStreamCloseImpl clears m_sinkController) this is the end of the body:
+// end() flushes what the sink buffered and detaches the controller. A throw from it rejects the promise
+// the sink's owner is waiting on.
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* state = uncheckedDowncast<JSDirectSinkCloseState>(callFrame->argument(1));
+    JSObject* sinkController = state->m_sinkController.get();
+    if (!sinkController)
+        return JSValue::encode(jsUndefined());
+    MarkedArgumentBuffer noArgs;
+    Bun::WebStreams::invokeMethod(vm, globalObject, sinkController, builtinNames(vm).endPublicName(), noArgs);
     RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(jsUndefined());
 }

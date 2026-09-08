@@ -45,7 +45,7 @@ namespace WebCore {
 // Signature of every entry:  name(JSC::JSValue resolutionValue, contextCell at argument(1)).
 
 // owner: WebStreamsMisc.cpp — the shared "fulfillment step that returns undefined" / no-op
-// reaction (readableStreamCancel; readDirectStream's `.then(noop)`). context: unused.
+// reaction (readableStreamCancel, tee's reader-closed watch). context: unused.
 #define FOR_EACH_WEB_STREAMS_REACTION_HANDLER_MISC(V) \
     V(onReturnUndefined)
 
@@ -157,11 +157,14 @@ namespace WebCore {
 //   onNativePull*: context = the JSNativeStreamSourceAdapter.
 //   onNativeSourceCallCloseMicrotask: the native source's `queueMicrotask(callClose)` job;
 //     context = the adapter.
+//   onReadDirectStreamPullFulfilled: readDirectStream's async pull() resolved; ends the sink
+//     controller unless pull() already closed it. context = the JSDirectSinkCloseState.
 //   onReadStreamIntoSink*: context = the JSReadStreamIntoSinkOperation.
 #define FOR_EACH_WEB_STREAMS_REACTION_HANDLER_BUN_SOURCE(V) \
     V(onNativePullFulfilled)                                \
     V(onNativePullRejected)                                 \
     V(onNativeSourceCallCloseMicrotask)                     \
+    V(onReadDirectStreamPullFulfilled)                      \
     V(onReadStreamIntoSinkReadManyFulfilled)                \
     V(onReadStreamIntoSinkChunk)                            \
     V(onReadStreamIntoSinkClose)                            \
