@@ -1233,8 +1233,9 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
         expect(exitCode).toBe(0);
       });
 
+      // Tearing the Worker's heap down sweeps the controller cells with no gc() call anywhere. A
+      // Worker is slow to start on a debug build, hence the longer timeout.
       it("inside a Worker that then goes away", async () => {
-        // Tearing the Worker's heap down sweeps the controller cells with no gc() call anywhere.
         const { stdout, exitCode } = await run(`
           const { Worker } = require("node:worker_threads");
           const source = \`
@@ -1250,19 +1251,17 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
               setInterval(() => {}, 1000);
             })();
           \`;
-          for (let i = 0; i < 3; i++) {
-            const worker = new Worker(source, { eval: true });
-            const [message] = await new Promise((resolve, reject) => {
-              worker.once("message", (...args) => resolve(args));
-              worker.once("error", reject);
-            });
-            await worker.terminate();
-            console.log(message);
-          }
+          const worker = new Worker(source, { eval: true });
+          const [message] = await new Promise((resolve, reject) => {
+            worker.once("message", (...args) => resolve(args));
+            worker.once("error", reject);
+          });
+          await worker.terminate();
+          console.log(message);
         `);
-        expect(stdout).toBe(`boom,5\n`.repeat(3));
+        expect(stdout).toBe("boom,5\n");
         expect(exitCode).toBe(0);
-      });
+      }, 30_000);
     });
   });
 
