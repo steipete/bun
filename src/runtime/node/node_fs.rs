@@ -7391,22 +7391,10 @@ impl NodeFS {
                     ..Default::default()
                 });
             }
-            // Let the OS walk the original components. Resolving to an absolute
-            // path first would collapse `..` before a preceding symlink is followed.
+            // Let realpath walk the original components without opening and
+            // closing the target, which would release process-owned POSIX locks.
             let path = args.path.slice_z(inbuf);
-
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let flags = sys::O::PATH; // O_PATH is faster
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let flags = sys::O::RDONLY | sys::O::NONBLOCK | sys::O::NOCTTY;
-
-            let fd = match sys::open(path, flags, 0) {
-                Err(err) => return Err(err.with_path(path)),
-                Ok(fd_) => fd_,
-            };
-            let _close = scopeguard::guard(fd, |fd| fd.close());
-
-            let buf = match Syscall::get_fd_path(fd, &mut outbuf) {
+            let buf = match Syscall::realpath(path, &mut outbuf) {
                 Err(err) => return Err(err.with_path(path)),
                 Ok(buf_) => buf_,
             };
