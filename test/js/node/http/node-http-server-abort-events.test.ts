@@ -557,18 +557,6 @@ describe("request body arriving after the response was ended", () => {
       return promise;
     }
 
-    // Sends the request in one packet and waits for the server to close the
-    // connection; resolves with what the client received. The close listener is
-    // registered before writing: client and server share this event loop, so
-    // the client's 'close' may fire before the server-side one is observed.
-    async function requestUntilClosed(server: Server, request: string) {
-      const client = await rawClient(await listen(server));
-      const clientClosed = once(client.socket, "close");
-      await client.write(request);
-      await clientClosed;
-      return client.response("first");
-    }
-
     test.each(requestHeads)(
       "a consumer attached before the synchronous res.end() receives a body sent with the headers (%s)",
       async (_, head) => {
@@ -588,7 +576,8 @@ describe("request body arriving after the response was ended", () => {
           ...reqState(req),
         }));
         try {
-          const response = await requestUntilClosed(server, `${head}Content-Length: 5\r\n\r\nhello`);
+          const client = await rawClient(await listen(server));
+          await client.write(`${head}Content-Length: 5\r\n\r\nhello`);
           expect(await observed).toEqual({
             body: "hello",
             events: ["end", "close"],
@@ -597,8 +586,10 @@ describe("request body arriving after the response was ended", () => {
             destroyed: true,
             aborted: false,
           });
-          // The response made it out before the connection was closed.
-          expect(response).toStartWith("HTTP/1.1 200 OK");
+          // The server closed the connection, as the request asked, and the
+          // response made it out before that.
+          await once(client.socket, "close");
+          expect(await client.response("first")).toStartWith("HTTP/1.1 200 OK");
           await closeServer(server);
         } finally {
           server.closeAllConnections();
@@ -616,10 +607,8 @@ describe("request body arriving after the response was ended", () => {
       });
       const observed = observeUntilSocketClose(server, req => ({ events: [...events], ...reqState(req) }));
       try {
-        await requestUntilClosed(
-          server,
-          "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
-        );
+        const client = await rawClient(await listen(server));
+        await client.write("POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello");
         expect(await observed).toEqual({
           events: ["end", "close"],
           complete: true,
@@ -627,6 +616,7 @@ describe("request body arriving after the response was ended", () => {
           destroyed: true,
           aborted: false,
         });
+        await once(client.socket, "close");
         await closeServer(server);
       } finally {
         server.closeAllConnections();
@@ -643,12 +633,10 @@ describe("request body arriving after the response was ended", () => {
       });
       const observed = observeUntilSocketClose(server, req => ({ events: [...events], ...reqState(req) }));
       try {
+        const client = await rawClient(await listen(server));
         // The rest of the body never comes; the server closes the connection
         // after the response regardless, like Node's destroySoon().
-        const response = await requestUntilClosed(
-          server,
-          "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 100\r\n\r\nabc",
-        );
+        await client.write("POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 100\r\n\r\nabc");
         expect(await observed).toEqual({
           events: ["data:abc"],
           complete: false,
@@ -656,7 +644,8 @@ describe("request body arriving after the response was ended", () => {
           destroyed: false,
           aborted: false,
         });
-        expect(response).toStartWith("HTTP/1.1 200 OK");
+        await once(client.socket, "close");
+        expect(await client.response("first")).toStartWith("HTTP/1.1 200 OK");
         // The request was released even though its body never completed.
         await closeServer(server);
       } finally {
