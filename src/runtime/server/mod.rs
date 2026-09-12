@@ -1480,8 +1480,9 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                     }
                     // If we ended the response without attaching an ondata handler, we discard the body read stream
                     else if !matches!(http_result, HttpResult::Pending) {
+                        let this_value = nhr.get_this_value();
                         // SAFETY: `vm` is the process-static VirtualMachine.
-                        nhr.maybe_stop_reading_body(unsafe { &mut *vm });
+                        nhr.maybe_stop_reading_body(unsafe { &mut *vm }, this_value);
                     }
                 }
                 if nhr_flags.contains(NhrFlags::TUNNELED) {
