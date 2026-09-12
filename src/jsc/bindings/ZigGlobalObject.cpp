@@ -4,6 +4,7 @@
 #include "BuiltinModuleKeys.h"
 #include "IsolatedModuleCache.h"
 #include "MessagePort.h"
+#include "PathInlines.h"
 #include "helpers.h"
 #include "JavaScriptCore/ArgList.h"
 #include "JavaScriptCore/JSCellButterfly.h"
@@ -3401,6 +3402,19 @@ extern "C" bool Bun__standaloneModuleHasModuleInfo(const Latin1Character*, size_
 extern "C" bool Bun__hasStandaloneModuleGraph();
 extern "C" int ModuleLoader__builtinAliasIndex(const Latin1Character*, size_t);
 extern "C" bool Bun__hasPluginRunner(void*);
+
+static String fileURLSuffix(const URL& url)
+{
+    return makeString(url.queryWithLeadingQuestionMark(), url.fragmentIdentifierWithLeadingNumberSign());
+}
+
+static String resolvedModuleKey(const String& resolved, const String& suffix)
+{
+    if (isAbsolutePath(resolved) && (suffix.startsWith('#') || resolved.find('?') != WTF::notFound || resolved.find('#') != WTF::notFound))
+        return makeString(URL::fileURLWithFileSystemPath(resolved).string(), suffix);
+    return makeString(resolved, suffix);
+}
+
 JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject,
     JSModuleLoader* loader, JSValue key,
     JSValue referrer, RefPtr<JSC::ScriptFetcher>, bool)
@@ -3410,6 +3424,8 @@ JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     WTF::String keyString;
+    WTF::String requestedSuffix;
+    bool splitSuffix = true;
     if (key.isString()) {
         auto moduleName = uncheckedDowncast<JSString>(key)->value(globalObject);
         RETURN_IF_EXCEPTION(scope, {});
@@ -3431,6 +3447,8 @@ JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject
             auto url = WTF::URL(moduleName);
             if (url.isValid() && !url.isEmpty()) {
                 keyString = url.fileSystemPath();
+                requestedSuffix = fileURLSuffix(url);
+                splitSuffix = false;
             } else {
                 keyString = moduleName;
             }
@@ -3445,6 +3463,11 @@ JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject
     if (referrer && referrer.isString()) {
         referrerString = referrer.toWTFString(globalObject);
         RETURN_IF_EXCEPTION(scope, {});
+        if (referrerString.startsWith("file://"_s)) {
+            auto url = WTF::URL(referrerString);
+            if (url.isValid() && !url.isEmpty())
+                referrerString = url.fileSystemPath();
+        }
     }
 
     if (globalObject->onLoadPlugins.hasVirtualModules()) {
@@ -3482,19 +3505,15 @@ JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject
     BunString keyZ = Bun::toString(keyString);
     BunString referrerZ = Bun::toString(referrerString);
     BunString queryZ = BunStringEmpty;
-    Zig__GlobalObject__resolve(&res, globalObject, &keyZ, &referrerZ, &queryZ);
+    Zig__GlobalObject__resolve(&res, globalObject, &keyZ, &referrerZ, &queryZ, splitSuffix);
     RETURN_IF_EXCEPTION(scope, {});
     if (!res.success) {
         throwException(scope, res.result.err, globalObject);
         return {};
     }
     auto resolved = res.result.value.transferToWTFString();
-    auto query = queryZ.transferToWTFString();
-
-    if (!query.isEmpty()) {
-        return Identifier::fromString(vm, makeString(resolved, query));
-    }
-    return Identifier::fromString(vm, resolved);
+    auto suffix = requestedSuffix.isEmpty() ? queryZ.transferToWTFString() : requestedSuffix;
+    return Identifier::fromString(vm, resolvedModuleKey(resolved, suffix));
 }
 
 JSC::Identifier StandaloneGlobalObject::moduleLoaderResolve(JSGlobalObject* globalObject, JSModuleLoader* loader, JSValue key, JSValue referrer, RefPtr<JSC::ScriptFetcher> fetcher, bool b)
@@ -3554,10 +3573,8 @@ JSC::JSPromise* GlobalObject::moduleLoaderImportModule(JSGlobalObject* jsGlobalO
         sourceOriginStringHolder = String("."_s);
     } else if (sourceURL.protocolIsFile()) {
         sourceOriginStringHolder = sourceURL.fileSystemPath();
-        auto query = sourceURL.queryWithLeadingQuestionMark();
-        auto referrerKey = query.isEmpty()
-            ? JSC::Identifier::fromString(vm, sourceOriginStringHolder)
-            : JSC::Identifier::fromString(vm, makeString(sourceOriginStringHolder, query));
+        auto suffix = fileURLSuffix(sourceURL);
+        auto referrerKey = JSC::Identifier::fromString(vm, resolvedModuleKey(sourceOriginStringHolder, suffix));
         referrerAsyncOrder = globalObject->moduleLoader()->asyncEvaluationOrderForKey(referrerKey);
     } else if (sourceURL.protocol() == "builtin"_s) {
         ASSERT(sourceURL.string().startsWith("builtin://"_s));
@@ -3579,10 +3596,14 @@ JSC::JSPromise* GlobalObject::moduleLoaderImportModule(JSGlobalObject* jsGlobalO
     }
 
     {
+        WTF::String requestedSuffix;
+        bool splitSuffix = true;
         if (moduleName.startsWith("file://"_s)) {
             auto url = WTF::URL(moduleName);
             if (url.isValid() && !url.isEmpty()) {
                 moduleName = url.fileSystemPath();
+                requestedSuffix = fileURLSuffix(url);
+                splitSuffix = false;
             }
         }
 
@@ -3590,20 +3611,15 @@ JSC::JSPromise* GlobalObject::moduleLoaderImportModule(JSGlobalObject* jsGlobalO
         BunString moduleNameZ = Bun::toString(moduleName);
         BunString sourceOriginZ = Bun::toString(sourceOriginStringHolder);
         BunString queryZ = BunStringEmpty;
-        Zig__GlobalObject__resolve(&res, globalObject, &moduleNameZ, &sourceOriginZ, &queryZ);
+        Zig__GlobalObject__resolve(&res, globalObject, &moduleNameZ, &sourceOriginZ, &queryZ, splitSuffix);
         RETURN_IF_EXCEPTION(scope, JSC::JSPromise::rejectedPromiseWithCaughtException(globalObject, scope));
         if (!res.success) [[unlikely]] {
             throwException(scope, res.result.err, globalObject);
             return JSC::JSPromise::rejectedPromiseWithCaughtException(globalObject, scope);
         }
         auto resolved = res.result.value.transferToWTFString();
-        auto query = queryZ.transferToWTFString();
-
-        if (query.isEmpty()) {
-            resolvedIdentifier = JSC::Identifier::fromString(vm, resolved);
-        } else {
-            resolvedIdentifier = JSC::Identifier::fromString(vm, makeString(resolved, query));
-        }
+        auto suffix = requestedSuffix.isEmpty() ? queryZ.transferToWTFString() : requestedSuffix;
+        resolvedIdentifier = JSC::Identifier::fromString(vm, resolvedModuleKey(resolved, suffix));
     }
 
     // The C++ module loader now extracts `with.type` into a
@@ -3650,11 +3666,21 @@ JSC::JSPromise* GlobalObject::moduleLoaderFetch(JSGlobalObject* globalObject,
     if (scope.exception()) [[unlikely]]
         return rejectedInternalPromise(globalObject, scope.exception()->value());
 
-    if (moduleKey.endsWith(".node"_s)) {
+    WTF::String fetchKey = moduleKey;
+    bool preservePathDelimiters = false;
+    if (moduleKey.startsWith("file://"_s)) {
+        auto url = WTF::URL(moduleKey);
+        if (url.isValid() && !url.isEmpty()) {
+            fetchKey = url.fileSystemPath();
+            preservePathDelimiters = true;
+        }
+    }
+
+    if (fetchKey.endsWith(".node"_s)) {
         return rejectedInternalPromise(globalObject, createTypeError(globalObject, "To load Node-API modules, use require() or process.dlopen instead of import."_s));
     }
 
-    auto moduleKeyBun = Bun::toString(moduleKey);
+    auto moduleKeyBun = Bun::toString(fetchKey);
     auto& sourceString = vm.propertyNames->undefinedKeyword.string();
     auto typeAttributeString = String();
 
@@ -3684,7 +3710,8 @@ JSC::JSPromise* GlobalObject::moduleLoaderFetch(JSGlobalObject* globalObject,
             &res,
             &moduleKeyBun,
             &source,
-            typeAttributeString.isEmpty() ? nullptr : &typeAttribute);
+            typeAttributeString.isEmpty() ? nullptr : &typeAttribute,
+            preservePathDelimiters);
         RETURN_IF_EXCEPTION(scope, rejectedInternalPromise(globalObject, scope.exception()->value()));
         if (auto* promise = dynamicDowncast<JSC::JSPromise>(result))
             return promise;
@@ -3699,7 +3726,8 @@ JSC::JSPromise* GlobalObject::moduleLoaderFetch(JSGlobalObject* globalObject,
         &res,
         &moduleKeyBun,
         &source,
-        typeAttributeString.isEmpty() ? nullptr : &typeAttribute);
+        typeAttributeString.isEmpty() ? nullptr : &typeAttribute,
+        preservePathDelimiters);
 
     RETURN_IF_EXCEPTION(scope, rejectedInternalPromise(globalObject, scope.exception()->value()));
     ASSERT(result);
@@ -3721,7 +3749,7 @@ static JSSourceCode* fetchSourceSync(Zig::GlobalObject* globalObject, const Iden
     ErrorableResolvedSource res;
     auto keyBun = Bun::toString(key.string());
     auto source = Bun::toString(vm.propertyNames->undefinedKeyword.string());
-    JSValue result = Bun::fetchESMSourceCodeSync(globalObject, jsString(vm, key.string()), &res, &keyBun, &source, nullptr);
+    JSValue result = Bun::fetchESMSourceCodeSync(globalObject, jsString(vm, key.string()), &res, &keyBun, &source, nullptr, false);
     RETURN_IF_EXCEPTION(scope, nullptr);
     return result ? dynamicDowncast<JSSourceCode>(result) : nullptr;
 }

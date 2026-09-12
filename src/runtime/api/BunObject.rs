@@ -1120,6 +1120,8 @@ fn resolve_with_args<const IS_FILE_PATH: bool>(
         from,
         Some(&mut query_string),
         mode,
+        true,
+        mode.is_esm(),
     )? {
         Ok(path) => path,
         Err(err) if err.as_class_ref::<jsc::ResolveMessage>().is_some() => {

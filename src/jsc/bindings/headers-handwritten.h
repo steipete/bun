@@ -395,7 +395,8 @@ extern "C" JSC::JSPromise* Bun__transpileFile(
     ErrorableResolvedSource* result,
     bool allowPromise,
     bool isCommonJSRequire,
-    BunLoaderType forceLoaderType);
+    BunLoaderType forceLoaderType,
+    bool preservePathDelimiters);
 
 extern "C" bool Bun__fetchBuiltinModule(
     void* bunVM,

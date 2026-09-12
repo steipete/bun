@@ -89,16 +89,18 @@ ImportMetaObject* ImportMetaObject::create(JSC::JSGlobalObject* globalObject, JS
 
 ImportMetaObject* ImportMetaObject::createFromSpecifier(JSC::JSGlobalObject* globalObject, const String& specifier)
 {
-    auto index = specifier.find('?');
-    URL url;
-    if (index != notFound) {
-        StringView view = specifier;
-        url = URL::fileURLWithFileSystemPath(view.substring(0, index));
-        url.setQuery(view.substring(index + 1));
-    } else {
-        url = URL::fileURLWithFileSystemPath(specifier);
-    }
-    return create(globalObject, url.string());
+    if (specifier.startsWith("file://"_s))
+        return create(globalObject, specifier);
+
+    auto query = specifier.find('?');
+    auto fragment = specifier.find('#');
+    auto suffix = std::min(query, fragment);
+    if (suffix == notFound)
+        return create(globalObject, URL::fileURLWithFileSystemPath(specifier).string());
+
+    StringView view = specifier;
+    auto url = URL::fileURLWithFileSystemPath(view.left(suffix));
+    return create(globalObject, makeString(url.string(), view.substring(suffix)));
 }
 
 extern "C" JSC::EncodedJSValue functionImportMeta__resolveSync(JSC::JSGlobalObject* lexicalGlobalObject, JSC::CallFrame* callFrame)

@@ -25,6 +25,106 @@ test("[no query, query]", async () => {
   expect(globalThis.importQueryFixtureOrder).toEqual([resolvedURL, resolvedURL + "?query"]);
 });
 
+test("file URL queries and fragments preserve module identity and import.meta.url", async () => {
+  using dir = tempDir("import-url-suffixes", {
+    "dependency.js": `export const value = "dependency";`,
+    "target.js": `
+      const { value } = await import("./dependency.js");
+      globalThis.importURLSuffixOrder ??= [];
+      globalThis.importURLSuffixOrder.push(import.meta.url);
+      export const url = import.meta.url;
+      export const dependency = value;
+    `,
+    "target#copy.js": `
+      const { value } = await import("./dependency.js");
+      globalThis.importURLSuffixOrder.push(import.meta.url);
+      export const url = import.meta.url;
+      export const dependency = value;
+    `,
+    ...(process.platform === "win32"
+      ? {}
+      : {
+          "target?copy.js": `
+            const { value } = await import("./dependency.js");
+            globalThis.importURLSuffixOrder.push(import.meta.url);
+            export const url = import.meta.url;
+            export const dependency = value;
+          `,
+        }),
+    "entry.js": `
+      import { resolve } from "node:path";
+      import { pathToFileURL } from "node:url";
+      globalThis.importURLSuffixOrder = [];
+      const base = pathToFileURL(resolve("target.js")).href;
+      const specifiers = [
+        base + "?version=1",
+        base + "#generation-1",
+        "./target.js?version=2#generation-2",
+        pathToFileURL(resolve("target#copy.js")).href,
+        ...(process.platform === "win32" ? [] : [pathToFileURL(resolve("target?copy.js")).href]),
+      ];
+      const modules = [];
+      for (const specifier of specifiers) modules.push(await import(specifier));
+      console.log(JSON.stringify({
+        urls: modules.map(module => module.url),
+        dependencies: modules.map(module => module.dependency),
+        order: globalThis.importURLSuffixOrder,
+      }));
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "entry.js"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    proc.stdout.text(),
+    proc.stderr.text(),
+    proc.exited,
+  ]);
+  const base = Bun.pathToFileURL(`${dir}/target.js`).href;
+  const expected = [
+    base + "?version=1",
+    base + "#generation-1",
+    base + "?version=2#generation-2",
+    Bun.pathToFileURL(`${dir}/target#copy.js`).href,
+    ...(process.platform === "win32" ? [] : [Bun.pathToFileURL(`${dir}/target?copy.js`).href]),
+  ];
+  expect({ ...JSON.parse(stdout.trim()), stderr, exitCode }).toEqual({
+    urls: expected,
+    dependencies: expected.map(() => "dependency"),
+    order: expected,
+    stderr: "",
+    exitCode: 0,
+  });
+});
+
+test("CommonJS resolution preserves literal fragment delimiters in filenames", async () => {
+  using dir = tempDir("require-fragment-filename", {
+    "target#copy.cjs": `module.exports = "literal-fragment";`,
+    "entry.cjs": `console.log(require("./target#copy.cjs"));`,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "entry.cjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    proc.stdout.text(),
+    proc.stderr.text(),
+    proc.exited,
+  ]);
+  expect({ stdout, stderr, exitCode }).toEqual({
+    stdout: "literal-fragment\n",
+    stderr: "",
+    exitCode: 0,
+  });
+});
+
 for (let order of [
   [resolvedPath, resolvedPath + "?query", resolvedPath + "?query2"],
   [resolvedPath + "?query", resolvedPath + "?query2", resolvedPath],

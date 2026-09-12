@@ -819,7 +819,7 @@ JSValue fetchCommonJSModuleNonBuiltin(
     BunLoaderType forceLoaderType,
     JSC::ThrowScope& scope)
 {
-    Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, false, !isExtension, forceLoaderType);
+    Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, false, !isExtension, forceLoaderType, false);
     if (res->success && res->result.value.isCommonJSModule) {
         if constexpr (isExtension) {
             target->evaluateWithPotentiallyOverriddenCompile(globalObject, specifierWtfString, specifierValue, res->result.value);
@@ -935,11 +935,14 @@ static JSValue fetchESMSourceCode(
     ErrorableResolvedSource* res,
     BunString* specifier,
     BunString* referrer,
-    BunString* typeAttribute)
+    BunString* typeAttribute,
+    bool preservePathDelimiters)
 {
     void* bunVM = globalObject->bunVM();
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    auto specifierKey = specifierJS->value(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
 
     const auto reject = [&](JSC::JSValue exception) -> JSValue {
         if constexpr (allowPromise) {
@@ -1081,7 +1084,7 @@ static JSValue fetchESMSourceCode(
 
     const bool useIsolationCache = Bun::IsolatedModuleCache::canUse(vm, bunVM, typeAttribute);
     if (useIsolationCache) {
-        if (auto* cached = Bun::IsolatedModuleCache::lookup(vm, specifier->toWTFString(BunString::ZeroCopy))) {
+        if (auto* cached = Bun::IsolatedModuleCache::lookup(vm, specifierKey)) {
             if (cached->sourceType() != JSC::SourceProviderSourceType::Program) {
                 RELEASE_AND_RETURN(scope, rejectOrResolve(JSC::JSSourceCode::create(vm, JSC::SourceCode(Ref(*cached)))));
             }
@@ -1107,12 +1110,12 @@ static JSValue fetchESMSourceCode(
     }
 
     if constexpr (allowPromise) {
-        auto* pendingCtx = Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, true, false, BunLoaderTypeNone);
+        auto* pendingCtx = Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, true, false, BunLoaderTypeNone, preservePathDelimiters);
         if (pendingCtx) {
             return pendingCtx;
         }
     } else {
-        Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, false, false, BunLoaderTypeNone);
+        Bun__transpileFile(bunVM, globalObject, specifier, referrer, typeAttribute, res, false, false, BunLoaderTypeNone, preservePathDelimiters);
     }
 
     if (res->success && res->result.value.isCommonJSModule) {
@@ -1165,7 +1168,7 @@ static JSValue fetchESMSourceCode(
             value);
         auto source = JSC::SourceCode(
             JSC::SyntheticSourceProvider::create(WTF::move(function),
-                JSC::SourceOrigin(), specifier->toWTFString(BunString::ZeroCopy)));
+                JSC::SourceOrigin(), specifierKey));
         JSC::ensureStillAliveHere(value);
         RELEASE_AND_RETURN(scope, rejectOrResolve(JSSourceCode::create(globalObject->vm(), WTF::move(source))));
     }
@@ -1182,7 +1185,7 @@ static JSValue fetchESMSourceCode(
             value);
         auto source = JSC::SourceCode(
             JSC::SyntheticSourceProvider::create(WTF::move(function),
-                JSC::SourceOrigin(), specifier->toWTFString(BunString::ZeroCopy)));
+                JSC::SourceOrigin(), specifierKey));
         JSC::ensureStillAliveHere(value);
         RELEASE_AND_RETURN(scope, rejectOrResolve(JSSourceCode::create(globalObject->vm(), WTF::move(source))));
     } else if (res->result.value.tag == SyntheticModuleType::ExportDefaultObject) {
@@ -1197,14 +1200,14 @@ static JSValue fetchESMSourceCode(
             value);
         auto source = JSC::SourceCode(
             JSC::SyntheticSourceProvider::create(WTF::move(function),
-                JSC::SourceOrigin(), specifier->toWTFString(BunString::ZeroCopy)));
+                JSC::SourceOrigin(), specifierKey));
         JSC::ensureStillAliveHere(value);
         RELEASE_AND_RETURN(scope, rejectOrResolve(JSSourceCode::create(globalObject->vm(), WTF::move(source))));
     }
 
     auto provider = Zig::SourceProvider::create(globalObject, res->result.value);
     if (useIsolationCache) {
-        Bun::IsolatedModuleCache::insert(vm, specifier->toWTFString(BunString::ZeroCopy), provider.get());
+        Bun::IsolatedModuleCache::insert(vm, specifierKey, provider.get());
     }
     RELEASE_AND_RETURN(scope, rejectOrResolve(JSC::JSSourceCode::create(vm, JSC::SourceCode(WTF::move(provider)))));
 }
@@ -1215,9 +1218,10 @@ JSValue fetchESMSourceCodeSync(
     ErrorableResolvedSource* res,
     BunString* specifier,
     BunString* referrer,
-    BunString* typeAttribute)
+    BunString* typeAttribute,
+    bool preservePathDelimiters)
 {
-    return fetchESMSourceCode<false>(globalObject, specifierJS, res, specifier, referrer, typeAttribute);
+    return fetchESMSourceCode<false>(globalObject, specifierJS, res, specifier, referrer, typeAttribute, preservePathDelimiters);
 }
 
 JSValue fetchESMSourceCodeAsync(
@@ -1226,9 +1230,10 @@ JSValue fetchESMSourceCodeAsync(
     ErrorableResolvedSource* res,
     BunString* specifier,
     BunString* referrer,
-    BunString* typeAttribute)
+    BunString* typeAttribute,
+    bool preservePathDelimiters)
 {
-    return fetchESMSourceCode<true>(globalObject, specifierJS, res, specifier, referrer, typeAttribute);
+    return fetchESMSourceCode<true>(globalObject, specifierJS, res, specifier, referrer, typeAttribute, preservePathDelimiters);
 }
 }
 
