@@ -105,9 +105,7 @@ public:
 
     /* node:http socket.end(): when the in-flight response still has bytes in
      * uWS's send buffer, a shutdown now would put the FIN ahead of them and
-     * truncate the response; when the finished response's request body is
-     * still being parsed out of the current read, it would drop that body.
-     * Returns true after handing the close to uWS in either case. */
+     * truncate the response. Returns true after handing the close to uWS. */
     bool shutdownAfterResponseDrains();
 
     /* Switch the connection into CONNECT-style tunnel mode after an accepted
