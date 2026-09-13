@@ -1159,7 +1159,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
           }
         }
 
-        socket.cork();
+        socket[kCorkForDispatcher]();
 
         if (isPipelined) {
           // Completion of a queued response is tracked through the pipeline
@@ -1449,6 +1449,9 @@ function onReadableStreamEnd() {}
 function clearUpgradeIncoming(socket) {
   socket[kUpgradeIncoming] = undefined;
 }
+const kCorkForDispatcher = Symbol("corkForDispatcher");
+const kReleaseDispatcherCork = Symbol("releaseDispatcherCork");
+const kDispatcherCorkDepth = Symbol("dispatcherCorkDepth");
 
 // Node.js hands the connection over to 'connect'/'upgrade' listeners with the
 // connection-listener set removed (onParserExecuteCommon removes its data/end/
@@ -1457,10 +1460,7 @@ function clearUpgradeIncoming(socket) {
 function detachSocketListenersForHandoff(socket) {
   socket.removeListener("error", socketOnError);
   socket.removeListener("timeout", onNodeHTTPServerSocketTimeout);
-  // A synchronously-finished response is fully uncorked by end(), then the
-  // dispatcher corks the reusable socket once before returning. Release that
-  // server-owned cork so raw CONNECT/Upgrade writes are not held forever.
-  socket.uncork();
+  socket[kReleaseDispatcherCork]();
   socket.on("end", onReadableStreamEnd);
 }
 function resolveHandoffPromise(promise) {
@@ -1620,6 +1620,7 @@ function getNodeHTTPServerSocket() {
     [kBytesWritten] = 0;
     [kHandle];
     [kUpgradeIncoming] = undefined;
+    [kDispatcherCorkDepth] = 0;
     server: Server;
     _httpMessage;
     _secureEstablished = false;
@@ -1696,6 +1697,27 @@ function getNodeHTTPServerSocket() {
           handle.ondrain = undefined;
         }
       }
+    }
+    [kCorkForDispatcher]() {
+      if (this[kDispatcherCorkDepth] !== 0) return;
+      this.cork();
+      this[kDispatcherCorkDepth] = this.writableCorked;
+    }
+    [kReleaseDispatcherCork]() {
+      if (this[kDispatcherCorkDepth] === 0) return;
+      this[kDispatcherCorkDepth] = 0;
+      super.uncork();
+    }
+    uncork() {
+      const dispatcherCorkDepth = this[kDispatcherCorkDepth];
+      const corkedBefore = this.writableCorked;
+      const result = super.uncork();
+      // A caller can consume the dispatcher cork before the next request and
+      // replace it with its own. Do not later release that caller-owned cork.
+      if (dispatcherCorkDepth !== 0 && corkedBefore <= dispatcherCorkDepth) {
+        this[kDispatcherCorkDepth] = 0;
+      }
+      return result;
     }
     #onDrain() {
       const handle = this[kHandle];
