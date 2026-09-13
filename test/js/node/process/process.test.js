@@ -1885,7 +1885,7 @@ describe("process.exitCode", () => {
   it.each(["undefined", "null"])("can be cleared with %s", async clearValue => {
     await runInlineFixture(
       `
-      const assert = require("node:assert/strict");
+      import assert from "node:assert/strict";
       process.exitCode = 42;
       process.exitCode = ${clearValue};
       assert.strictEqual(process.exitCode, undefined);
@@ -1906,7 +1906,7 @@ describe("process.exitCode", () => {
   it.each(["undefined", "null"])("process.exit(%s) clears an existing code", async clearValue => {
     await runInlineFixture(
       `
-      const assert = require("node:assert/strict");
+      import assert from "node:assert/strict";
       process.exitCode = 42;
       process.on("exit", code => {
         assert.strictEqual(code, 0);
@@ -1922,7 +1922,7 @@ describe("process.exitCode", () => {
   it("accepts a numeric exit code after clearing one", async () => {
     await runInlineFixture(
       `
-      const assert = require("node:assert/strict");
+      import assert from "node:assert/strict";
       process.exitCode = 42;
       process.exitCode = undefined;
       process.exitCode = 7;
@@ -1940,7 +1940,7 @@ describe("process.exitCode", () => {
   it("preserves a numeric exit code when validation rejects a replacement", async () => {
     await runInlineFixture(
       `
-      const assert = require("node:assert/strict");
+      import assert from "node:assert/strict";
       process.exitCode = 23;
       assert.throws(() => { process.exitCode = 1.5; }, { code: "ERR_OUT_OF_RANGE" });
       assert.strictEqual(process.exitCode, 23);
