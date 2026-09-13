@@ -3393,11 +3393,11 @@ fn js_string_to_wtf8(
     value: JSValue,
 ) -> JsResult<Utf8Bytes<'static>> {
     let view = value.to_js_string_view(global_object)?;
-    if !view.is_16bit() {
+    if view.is_8bit() {
         return Ok(view.to_utf8().into_owned());
     }
 
-    let units = view.utf16_slice();
+    let units = view.utf16();
     let mut bytes = Vec::with_capacity(units.len() * 3);
     let mut index = 0;
     while index < units.len() {
