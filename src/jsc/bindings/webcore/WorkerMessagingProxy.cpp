@@ -74,7 +74,10 @@ void* WebWorker__create(
     // NODE_USE_SYSTEM_CA as seen by the worker's own `env` option: 1 / 0, or -1 when it inherits the env.
     int8_t envUseSystemCa,
     BunString* preloadModulesPtr,
-    size_t preloadModulesLen);
+    size_t preloadModulesLen,
+    BunString* execArgvPreloadModulesPtr,
+    size_t execArgvPreloadModulesLen,
+    size_t execArgvEvalPreloadCount);
 // Raise a TerminationException in the worker VM at its next safepoint and wake its loop. Any thread.
 void WebWorker__requestTermination(void*);
 // Toggle the keep-alive this worker holds on the parent event loop. Parent thread.
@@ -141,6 +144,11 @@ ExceptionOr<void> WorkerMessagingProxy::startWorkerGlobalScope(const String& scr
         preloadModules.append(Bun::toString(str));
     }
 
+    Vector<BunString> execArgvPreloadModules;
+    execArgvPreloadModules.reserveInitialCapacity(m_options.execArgvPreloadModules.size());
+    for (auto& str : m_options.execArgvPreloadModules)
+        execArgvPreloadModules.append(Bun::toString(str));
+
     static_assert(sizeof(WTF::String) == sizeof(WTF::StringImpl*));
     std::span<WTF::StringImpl*> execArgv = m_options.execArgv
                                                .transform([](Vector<String>& vec) -> std::span<WTF::StringImpl*> {
@@ -178,8 +186,12 @@ ExceptionOr<void> WorkerMessagingProxy::startWorkerGlobalScope(const String& scr
         execArgv.size(),
         envUseSystemCa,
         preloadModules.begin(),
-        preloadModules.size());
+        preloadModules.size(),
+        execArgvPreloadModules.begin(),
+        execArgvPreloadModules.size(),
+        m_options.execArgvEvalPreloadCount);
     m_options.preloadModules.clear();
+    m_options.execArgvPreloadModules.clear();
 
     if (!m_workerThread) {
         m_state.store(State::Closed);
