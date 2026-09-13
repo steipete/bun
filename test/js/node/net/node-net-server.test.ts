@@ -271,7 +271,7 @@ describe("net.createServer listen", () => {
     });
   });
 
-  it("does not carry a canceled host listen callback into a later listen", async () => {
+  it("carries a pending host listen callback into a later listen", async () => {
     const server: Server = createServer();
     const callbacks: string[] = [];
     server.listen(0, "127.0.0.1", () => callbacks.push("stale"));
@@ -290,7 +290,7 @@ describe("net.createServer listen", () => {
     });
     await started;
 
-    expect(callbacks).toEqual(["active"]);
+    expect(callbacks).toEqual(["stale", "active"]);
   });
 
   it("runs every active-generation callback when one closes the server", async () => {

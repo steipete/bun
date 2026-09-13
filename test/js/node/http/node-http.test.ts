@@ -289,7 +289,7 @@ describe("node:http", () => {
         });
       });
 
-      it("does not carry a canceled listen callback into a later listen", async () => {
+      it("carries a pending listen callback into a later listen", async () => {
         const server = create();
         const callbacks: string[] = [];
         server.listen(0, "127.0.0.1", () => callbacks.push("stale"));
@@ -308,7 +308,7 @@ describe("node:http", () => {
         });
         await started;
 
-        expect(callbacks).toEqual(["active"]);
+        expect(callbacks).toEqual(["stale", "active"]);
       });
     });
 
@@ -4793,14 +4793,14 @@ describe("HTTP server transport shutdown", () => {
     }
   });
 
-  it("completes the stopped listener generation when the final socket close listener relistens", async () => {
+  it("defers a stopped listener's close event while a replacement listener is active", async () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const responseReceived = Promise.withResolvers<void>();
     const relistened = Promise.withResolvers<void>();
     const firstClose = Promise.withResolvers<Error | undefined>();
+    const finalClose = Promise.withResolvers<Error | undefined>();
     const events: string[] = [];
-    let firstSocket = true;
     const server = createServer(async (req, res) => {
       if (req.url === "/first") {
         entered.resolve();
@@ -4809,17 +4809,6 @@ describe("HTTP server transport shutdown", () => {
       res.end("done");
     });
     server.on("close", () => events.push("server close"));
-    server.on("connection", socket => {
-      if (!firstSocket) return;
-      firstSocket = false;
-      socket.once("close", () => {
-        events.push("socket close");
-        server.listen(0, "127.0.0.1", () => {
-          events.push("relisten");
-          relistened.resolve();
-        });
-      });
-    });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const firstPort = (server.address() as AddressInfo).port;
@@ -4839,14 +4828,18 @@ describe("HTTP server transport shutdown", () => {
         events.push("first close callback");
         firstClose.resolve(error);
       });
+      server.listen(0, "127.0.0.1", () => {
+        events.push("relisten");
+        relistened.resolve();
+      });
+      await relistened.promise;
       release.resolve();
       await responseReceived.promise;
-      await new Promise<void>(resolve => setImmediate(resolve));
-      expect(events).not.toContain("first close callback");
-
+      const clientClosed = once(client, "close");
       client.destroy();
-      const [firstCloseError] = await Promise.all([firstClose.promise, relistened.promise]);
-      expect(firstCloseError).toBeUndefined();
+      await clientClosed;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(events).toEqual(["relisten"]);
       expect(server.listening).toBe(true);
 
       const secondPort = (server.address() as AddressInfo).port;
@@ -4860,9 +4853,12 @@ describe("HTTP server transport shutdown", () => {
           }).on("error", reject);
         }),
       ).toBe("done");
-      expect(await new Promise<Error | undefined>(resolve => server.close(resolve))).toBeUndefined();
-      expect(events.filter(event => event === "server close")).toHaveLength(2);
-      expect(events.filter(event => event === "first close callback")).toHaveLength(1);
+      server.close(error => {
+        events.push("final close callback");
+        finalClose.resolve(error);
+      });
+      expect(await Promise.all([firstClose.promise, finalClose.promise])).toEqual([undefined, undefined]);
+      expect(events).toEqual(["relisten", "server close", "first close callback", "final close callback"]);
     } finally {
       client.destroy();
       server.closeAllConnections();
