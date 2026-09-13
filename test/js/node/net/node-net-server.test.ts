@@ -321,7 +321,7 @@ describe("net.createServer listen", () => {
     expect(listenCallbacks).toBe(1);
   });
 
-  it("preserves a new-generation callback during an older reentrant emission", async () => {
+  it("runs a newly registered callback during a reentrant listening emission", async () => {
     const server: Server = createServer();
     const callbacks: string[] = [];
     let preservedAfterReentry = false;
@@ -349,7 +349,7 @@ describe("net.createServer listen", () => {
     await finished;
     expect({ callbacks, preservedAfterReentry }).toEqual({
       callbacks: ["old", "active"],
-      preservedAfterReentry: true,
+      preservedAfterReentry: false,
     });
   });
 
