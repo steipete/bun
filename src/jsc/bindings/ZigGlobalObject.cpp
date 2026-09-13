@@ -3724,7 +3724,7 @@ JSC::JSPromise* GlobalObject::moduleLoaderFetch(JSGlobalObject* globalObject,
         }
     }
 
-    if (fetchKey.endsWith(".node"_s)) {
+    if (fetchKey.endsWith(".node"_s) && !moduleKey.startsWith("data:"_s)) {
         return rejectedInternalPromise(globalObject, createTypeError(globalObject, "To load Node-API modules, use require() or process.dlopen instead of import."_s));
     }
 
