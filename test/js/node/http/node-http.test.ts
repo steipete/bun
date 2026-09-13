@@ -4711,6 +4711,22 @@ describe("response header values are written as latin-1 bytes", () => {
 });
 
 describe("HTTP server transport shutdown", () => {
+  it("binds a successful close callback to the server", async () => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+
+    let receiver: unknown;
+    const error = await new Promise<Error | undefined>(resolve => {
+      server.close(function (error) {
+        receiver = this;
+        resolve(error);
+      });
+    });
+
+    expect({ error, receiver }).toEqual({ error: undefined, receiver: server });
+  });
+
   it("waits for an active keep-alive connection to close before server.close() completes", async () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();

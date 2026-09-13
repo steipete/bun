@@ -128,7 +128,7 @@ function emitCloseServer(self: Server, generation) {
   generation.handle = undefined;
   const callback = generation.closeCallback;
   generation.closeCallback = undefined;
-  callback?.();
+  callback?.$call(self);
   self.emit("close");
 }
 function emitCloseNTServer(this: Server, generation) {
