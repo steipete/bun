@@ -166,6 +166,7 @@ using namespace JSC;
     macro(sameSite) \
     macro(secure) \
     macro(self) \
+    macro(setChannelRef) \
     macro(sharedFd) \
     macro(signal) \
     macro(size) \
