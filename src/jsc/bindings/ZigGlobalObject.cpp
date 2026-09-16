@@ -3459,7 +3459,7 @@ static String fileURLSuffix(const URL& url)
 
 static String resolvedModuleKey(const String& resolved, const String& suffix)
 {
-    if (isAbsolutePath(resolved) && resolved.find('?') != WTF::notFound)
+    if (isAbsolutePath(resolved) && (resolved.find('?') != WTF::notFound || resolved.find('#') != WTF::notFound))
         return makeString(URL::fileURLWithFileSystemPath(resolved).string(), suffix);
     return makeString(resolved, suffix.startsWith('#') ? "?"_s : ""_s, suffix);
 }
