@@ -115,6 +115,20 @@ public:
      * body deliver it through the request first, like Node 26). */
     void upgradeToTunnelMode(bool afterBody = false);
 
+    void setRef(bool);
+    void updateTunnelLoopRef();
+
+    class WriteScope {
+    public:
+        WriteScope(JSC::VM&, JSNodeHTTPServerSocket&);
+        ~WriteScope();
+        WriteScope(const WriteScope&) = delete;
+        WriteScope& operator=(const WriteScope&) = delete;
+
+    private:
+        JSC::Strong<JSNodeHTTPServerSocket> m_socket;
+    };
+
     /* Trailer fields received after the current request's chunked body, as a
      * flat [name, value, ...] JS array preserving wire casing; jsUndefined()
      * when there are none. Clears the captured section. */
@@ -163,6 +177,16 @@ public:
 
     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject);
     void finishCreation(JSC::VM& vm);
+
+private:
+    bool ownsTunnelLoop() const;
+    bool hasPendingTunnelOutput() const;
+    void setTunnelLoopRef(bool);
+
+    bool m_tunnelLoopRefActive = false;
+    bool m_refRequested = true;
+    bool m_tunnelReadEnded = false;
+    unsigned m_tunnelWriteDepth = 0;
 };
 
 } // namespace Bun

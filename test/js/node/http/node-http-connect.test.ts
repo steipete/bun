@@ -6,6 +6,7 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import net from "node:net";
 import { join } from "node:path";
+import tls from "node:tls";
 function connectClient(proxyAddress: AddressInfo, targetAddress: AddressInfo, add_http_prefix: boolean) {
   const client = net.connect({ port: proxyAddress.port, host: proxyAddress.address }, () => {
     client.write(
@@ -872,9 +873,13 @@ test("CONNECT: process exits after the tunnel socket is re-emitted as a connecti
       "-e",
       `const http = require("node:http");
        let endCount = 0;
+       let socketCloseCount = 0;
+       let serverCloseCount = 0;
        const server = http.createServer(() => { throw new Error("request listener should not run"); });
+       server.on("close", () => serverCloseCount++);
        server.on("connect", (req, socket) => {
          socket.on("end", () => endCount++);
+         socket.on("close", () => socketCloseCount++);
          socket.write("HTTP/1.1 200 Connection Established\\r\\n\\r\\n");
          server.emit("connection", socket);
          server.close();
@@ -883,7 +888,9 @@ test("CONNECT: process exits after the tunnel socket is re-emitted as a connecti
          http.request({ port: server.address().port, method: "CONNECT" }).end();
        });
        process.on("exit", () => {
-         if (endCount !== 1) throw new Error("end fired " + endCount + " times (expected 1)");
+         if (endCount > 1) throw new Error("end fired " + endCount + " times (expected at most 1)");
+         if (socketCloseCount !== 1 || serverCloseCount !== 1)
+           throw new Error("close counts: " + socketCloseCount + "/" + serverCloseCount);
          console.log("ok");
        });`,
     ],
@@ -898,4 +905,482 @@ test("CONNECT: process exits after the tunnel socket is re-emitted as a connecti
     exitCode: 0,
     signalCode: null,
   });
+});
+
+test.each([
+  ["connect", "same"],
+  ["connect", "foreign"],
+  ["upgrade", "same"],
+  ["upgrade", "foreign"],
+])("reinjects a %s tunnel into a %s HTTP server", async (event, targetKind) => {
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `const http = require("node:http");
+       const assert = require("node:assert/strict");
+       const event = process.argv[1];
+       const foreign = process.argv[2] === "foreign";
+       const body = "parsed after native handoff";
+       let requests = 0;
+       let socketCloses = 0;
+       let serverCloses = 0;
+       const handler = (req, res) => {
+         requests++;
+         assert.equal(req.url, "/after-handoff");
+         assert.equal(req.socket.server, target);
+         res.writeHead(200, { "content-length": Buffer.byteLength(body) });
+         res.end(body);
+       };
+       const original = http.createServer(foreign ? () => { throw Error("wrong parser owner"); } : handler);
+       const target = foreign ? http.createServer(handler) : original;
+       original.on("close", () => serverCloses++);
+       original.on(event, (_req, socket) => {
+         socket.on("close", () => socketCloses++);
+         socket.write(event === "connect"
+           ? "HTTP/1.1 200 Connection Established\\r\\n\\r\\n"
+           : "HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: test\\r\\n\\r\\n");
+         target.emit("connection", socket);
+       });
+       original.listen(0, "127.0.0.1", () => {
+         const request = http.request({
+           hostname: "127.0.0.1", port: original.address().port,
+           method: event === "connect" ? "CONNECT" : "GET",
+           path: event === "connect" ? "example.invalid:443" : "/",
+           headers: event === "upgrade" ? { Connection: "Upgrade", Upgrade: "test" } : undefined,
+         });
+         request.on(event, (_response, socket, head) => {
+           let wire = head;
+           socket.on("data", chunk => { wire = Buffer.concat([wire, chunk]); });
+           socket.on("end", () => {
+             assert.ok(wire.toString().startsWith("HTTP/1.1 200"));
+             assert.equal(wire.subarray(wire.indexOf("\\r\\n\\r\\n") + 4).toString(), body);
+             original.close();
+           });
+           socket.write("GET /after-handoff HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n");
+         });
+         request.end();
+       });
+       process.on("exit", () => {
+         assert.deepEqual({ requests, socketCloses, serverCloses }, { requests: 1, socketCloses: 1, serverCloses: 1 });
+         console.log("ok");
+       });`,
+      event,
+      targetKind,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+    stdout: "ok\n",
+    stderr: "",
+    exitCode: 0,
+    signalCode: null,
+  });
+});
+
+test.each(["connect", "upgrade"])(
+  "detached %s tunnel EOF releases loop activity without closing the socket",
+  async event => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const http = require("node:http");
+       const assert = require("node:assert/strict");
+       const event = process.argv[1];
+       let ends = 0;
+       let socketCloses = 0;
+       let serverCloses = 0;
+       let connections = -1;
+       let tunnel;
+       const server = http.createServer(() => { throw Error("unexpected HTTP request"); });
+       server.on("close", () => serverCloses++);
+       server.on(event, (_req, socket) => {
+         tunnel = socket;
+         socket.on("end", () => {
+           ends++;
+           server.getConnections((error, count) => {
+             assert.ifError(error);
+             connections = count;
+           });
+         });
+         socket.on("close", () => socketCloses++);
+         socket.write(event === "connect"
+           ? "HTTP/1.1 200 Connection Established\\r\\n\\r\\n"
+           : "HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: test\\r\\n\\r\\n");
+         server.close();
+       });
+       server.listen(0, "127.0.0.1", () => {
+         http.request({ hostname: "127.0.0.1", port: server.address().port,
+           method: event === "connect" ? "CONNECT" : "GET",
+           headers: event === "upgrade" ? { Connection: "Upgrade", Upgrade: "test" } : undefined,
+         }).end();
+       });
+       process.on("exit", () => {
+         const state = { ends, socketCloses, serverCloses, connections,
+           readableEnded: tunnel.readableEnded, writable: tunnel.writable, destroyed: tunnel.destroyed };
+         assert.deepEqual(state, { ends: 1, socketCloses: 0, serverCloses: 0, connections: 1,
+           readableEnded: true, writable: true, destroyed: false });
+         console.log(JSON.stringify(state));
+       });`,
+        event,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+      stdout:
+        '{"ends":1,"socketCloses":0,"serverCloses":0,"connections":1,"readableEnded":true,"writable":true,"destroyed":false}\n',
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
+  },
+);
+
+async function* readTunnelProcessLines(stream: ReadableStream<Uint8Array>) {
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for await (const chunk of stream) {
+    buffered += decoder.decode(chunk, { stream: true });
+    let newline;
+    while ((newline = buffered.indexOf("\n")) !== -1) {
+      yield buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+    }
+  }
+  buffered += decoder.decode();
+  if (buffered) yield buffered;
+}
+
+describe.each([
+  ["connect", "http"],
+  ["upgrade", "http"],
+  ["connect", "https"],
+])("detached %s %s tunnel liveness", (event, protocol) => {
+  const modes =
+    protocol === "https"
+      ? ["write after FIN"]
+      : ["default reference", "explicit reference", "unreferenced", "write before FIN", "write after FIN"];
+  if (event === "upgrade") modes.push("write before upgrade body");
+  test.each(modes)("%s", async mode => {
+    const beforeBody = mode === "write before upgrade body";
+    const pendingWrite = mode === "write before FIN" || mode === "write after FIN" || beforeBody;
+    const payloadBytes = 8 * 1024 * 1024;
+    const responseHead =
+      event === "connect"
+        ? "HTTP/1.1 200 Connection Established\r\n\r\n"
+        : "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n";
+    // The peer lives in the test process so it cannot keep the tunnel subprocess alive.
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const http = require("node:http");
+           const assert = require("node:assert/strict");
+           const event = process.argv[1];
+           const mode = process.argv[2];
+           const protocol = process.argv[3];
+           const beforeBody = mode === "write before upgrade body";
+           const pendingWrite = mode === "write before FIN" || mode === "write after FIN" || beforeBody;
+           const counts = { ends: 0, drains: 0, writes: 0, afterFinWrites: 0, probes: 0, closes: 0, serverCloses: 0 };
+           let tunnel;
+           const unexpectedRequest = () => { throw Error("unexpected HTTP request"); };
+           const server = protocol === "https"
+             ? require("node:https").createServer({ cert: process.env.CERT, key: process.env.KEY, allowHalfOpen: true }, unexpectedRequest)
+             : http.createServer(unexpectedRequest);
+           server.on("close", () => counts.serverCloses++);
+           server.on(event, (_req, socket) => {
+             tunnel = socket;
+             socket.on("close", () => counts.closes++);
+             socket.on("drain", () => counts.drains++);
+             function writeAfterFin() {
+               socket.write("after-fin", error => {
+                 assert.ifError(error);
+                 counts.afterFinWrites++;
+                 socket.end();
+               });
+             }
+             function reportPending() {
+               setImmediate(() => {
+                 assert.ok(socket.writableLength > 0);
+                 assert.equal(counts.writes, 0);
+                 assert.equal(counts.serverCloses, 0);
+                 socket.unref();
+                 console.log("pending");
+               });
+             }
+             function writePayload() {
+               const accepted = socket.write(Buffer.alloc(${payloadBytes}, "x"), error => {
+                 assert.ifError(error);
+                 counts.writes++;
+                 if (beforeBody) {
+                   assert.equal(counts.ends, 0);
+                   socket.ref();
+                   console.log("flushed");
+                 } else {
+                   assert.equal(counts.ends, 1);
+                   writeAfterFin();
+                 }
+               });
+               assert.equal(accepted, false);
+             }
+             socket.on("end", () => {
+               counts.ends++;
+               if (!pendingWrite) return;
+               assert.equal(socket.writable, true);
+               assert.equal(socket.destroyed, false);
+               if (beforeBody) {
+                 assert.equal(counts.writes, 1);
+                 writeAfterFin();
+                 return;
+               }
+               if (mode === "write after FIN") writePayload();
+               reportPending();
+             });
+             if (pendingWrite) {
+               socket.resume();
+             } else if (mode !== "unreferenced") {
+               let received = "";
+               socket.on("data", chunk => {
+                 received += chunk;
+                 if (received.length < 4) return;
+                 assert.equal(received, "ping");
+                 counts.probes++;
+                 socket.end("pong");
+                 server.close();
+               });
+             }
+             socket.write(${JSON.stringify(responseHead)}, error => {
+               assert.ifError(error);
+               if (pendingWrite) {
+                 server.close();
+                 console.log("ready");
+                 if (mode === "write before FIN" || beforeBody) writePayload();
+                 if (beforeBody) reportPending();
+               } else {
+                 if (mode === "explicit reference") socket.unref().ref();
+                 if (mode === "unreferenced") socket.unref();
+                 server.unref();
+                 console.log("ready");
+               }
+             });
+           });
+           server.listen(0, "127.0.0.1", () => console.log(server.address().port));
+           process.on("exit", () => {
+             if (mode === "unreferenced") {
+               assert.deepEqual(counts, { ends: 0, drains: 0, writes: 0, afterFinWrites: 0, probes: 0, closes: 0, serverCloses: 0 });
+               assert.equal(server.listening, true);
+               assert.equal(tunnel.writable, true);
+               assert.equal(tunnel.destroyed, false);
+             } else {
+               assert.deepEqual(counts, { ends: 1, drains: pendingWrite ? 1 : 0,
+                 writes: pendingWrite ? 1 : 0, afterFinWrites: pendingWrite ? 1 : 0,
+                 probes: pendingWrite ? 0 : 1, closes: 1, serverCloses: 1 });
+             }
+             console.log("ok");
+           });`,
+        event,
+        mode,
+        protocol,
+      ],
+      env: protocol === "https" ? { ...bunEnv, CERT: tlsCert.cert, KEY: tlsCert.key } : bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const lines = readTunnelProcessLines(proc.stdout);
+    const stderr = proc.stderr.text();
+    const transportFailure = Promise.withResolvers<never>();
+    void transportFailure.promise.catch(() => {});
+    async function nextLine() {
+      const { value, done } = await Promise.race([lines.next(), transportFailure.promise]);
+      if (done) throw new Error("Tunnel subprocess exited before the expected lifecycle event");
+      return value;
+    }
+    let client: net.Socket | undefined;
+    try {
+      const port = Number(await nextLine());
+      expect(port).toBeGreaterThan(0);
+      client =
+        protocol === "https"
+          ? tls.connect({ port, host: "127.0.0.1", rejectUnauthorized: false, allowHalfOpen: true })
+          : net.connect({ port, host: "127.0.0.1" });
+      if (pendingWrite) client.pause();
+      const chunks: Buffer[] = [];
+      client.on("data", chunk => chunks.push(chunk));
+      client.on("error", transportFailure.reject);
+      const closed = once(client, "close");
+      void closed.catch(() => {});
+      await once(client, protocol === "https" ? "secureConnect" : "connect");
+      client.write(
+        event === "connect"
+          ? "CONNECT example.invalid:443 HTTP/1.1\r\nHost: example.invalid:443\r\n\r\n"
+          : "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: test\r\n" +
+              (beforeBody ? "Content-Length: 4\r\n" : "") +
+              "\r\n",
+      );
+      expect(await nextLine()).toBe("ready");
+      if (pendingWrite) {
+        if (!beforeBody) client.end();
+        expect(await nextLine()).toBe("pending");
+        client.resume();
+        if (beforeBody) {
+          expect(await nextLine()).toBe("flushed");
+          client.end("body");
+        }
+      } else if (mode !== "unreferenced") {
+        client.write("ping");
+      }
+      const stdout = (async () => {
+        let text = "";
+        for await (const line of lines) text += line + "\n";
+        return text;
+      })();
+      const [output, errors, exitCode] = await Promise.race([
+        Promise.all([stdout, stderr, proc.exited, closed]),
+        transportFailure.promise,
+      ]);
+      expect({ stdout: output, stderr: errors, exitCode, signalCode: proc.signalCode }).toEqual({
+        stdout: "ok\n",
+        stderr: "",
+        exitCode: 0,
+        signalCode: null,
+      });
+      expect(Buffer.concat(chunks)).toEqual(
+        pendingWrite
+          ? Buffer.concat([Buffer.from(responseHead), Buffer.alloc(payloadBytes, "x"), Buffer.from("after-fin")])
+          : Buffer.from(responseHead + (mode === "unreferenced" ? "" : "pong")),
+      );
+    } finally {
+      client?.destroy();
+    }
+  });
+});
+
+test("detached HTTPS CONNECT preserves successive writes started from drain", async () => {
+  const payloadBytes = 8 * 1024 * 1024;
+  const responseHead = "HTTP/1.1 200 Connection Established\r\n\r\n";
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `const https = require("node:https");
+       const assert = require("node:assert/strict");
+       const counts = { drains: 0, firstWrites: 0, secondWrites: 0, ends: 0, closes: 0, serverCloses: 0 };
+       const server = https.createServer({
+         cert: process.env.CERT, key: process.env.KEY, allowHalfOpen: true,
+       }, () => { throw Error("unexpected HTTP request"); });
+       server.on("close", () => counts.serverCloses++);
+       server.on("connect", (_req, socket) => {
+         socket.resume();
+         socket.on("end", () => counts.ends++);
+         socket.on("close", () => counts.closes++);
+         socket.on("drain", () => {
+           counts.drains++;
+           assert.ok(counts.drains <= 2);
+           assert.equal(socket.writableLength, 0);
+           if (counts.drains !== 1) return;
+
+           socket.ref();
+           socket.cork();
+           const accepted = socket.write(Buffer.alloc(${payloadBytes}, "y"), error => {
+             assert.ifError(error);
+             counts.secondWrites++;
+             assert.equal(counts.firstWrites, 1);
+             assert.equal(counts.drains, 2);
+             socket.end();
+           });
+           assert.equal(accepted, false);
+           socket.uncork();
+         });
+         socket.write(${JSON.stringify(responseHead)}, error => {
+           assert.ifError(error);
+           server.close();
+           const accepted = socket.write(Buffer.alloc(${payloadBytes}, "x"), error => {
+             assert.ifError(error);
+             counts.firstWrites++;
+             assert.equal(counts.drains, 1);
+           });
+           assert.equal(accepted, false);
+           setImmediate(() => {
+             assert.ok(socket.writableLength > 0);
+             assert.equal(counts.drains, 0);
+             assert.equal(counts.firstWrites, 0);
+             assert.equal(counts.secondWrites, 0);
+             socket.unref();
+             console.log("pending");
+           });
+         });
+       });
+       server.listen(0, "127.0.0.1", () => console.log(server.address().port));
+       process.on("exit", () => {
+         assert.deepEqual(counts, { drains: 2, firstWrites: 1, secondWrites: 1, ends: 1, closes: 1, serverCloses: 1 });
+         console.log("ok");
+       });`,
+    ],
+    env: { ...bunEnv, CERT: tlsCert.cert, KEY: tlsCert.key },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const lines = readTunnelProcessLines(proc.stdout);
+  const stderr = proc.stderr.text();
+  const transportFailure = Promise.withResolvers<never>();
+  void transportFailure.promise.catch(() => {});
+  async function nextLine() {
+    const { value, done } = await Promise.race([lines.next(), transportFailure.promise]);
+    if (done) throw new Error("Tunnel subprocess exited before the expected lifecycle event");
+    return value;
+  }
+  let client: tls.TLSSocket | undefined;
+  try {
+    const port = Number(await nextLine());
+    expect(port).toBeGreaterThan(0);
+    client = tls.connect({ port, host: "127.0.0.1", rejectUnauthorized: false, allowHalfOpen: true });
+    client.pause();
+    const chunks: Buffer[] = [];
+    let peerEnds = 0;
+    let peerCloses = 0;
+    const peer = client;
+    client.on("data", chunk => chunks.push(chunk));
+    client.on("error", transportFailure.reject);
+    client.on("end", () => {
+      peerEnds++;
+      peer.end();
+    });
+    client.on("close", () => peerCloses++);
+    const closed = once(client, "close");
+    void closed.catch(() => {});
+    await once(client, "secureConnect");
+    client.write("CONNECT example.invalid:443 HTTP/1.1\r\nHost: example.invalid:443\r\n\r\n");
+    expect(await nextLine()).toBe("pending");
+    client.resume();
+
+    const stdout = (async () => {
+      let text = "";
+      for await (const line of lines) text += line + "\n";
+      return text;
+    })();
+    const [output, errors, exitCode] = await Promise.race([
+      Promise.all([stdout, stderr, proc.exited, closed]),
+      transportFailure.promise,
+    ]);
+    expect({ stdout: output, stderr: errors, exitCode, signalCode: proc.signalCode, peerEnds, peerCloses }).toEqual({
+      stdout: "ok\n",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+      peerEnds: 1,
+      peerCloses: 1,
+    });
+    expect(Buffer.concat(chunks)).toEqual(
+      Buffer.concat([Buffer.from(responseHead), Buffer.alloc(payloadBytes, "x"), Buffer.alloc(payloadBytes, "y")]),
+    );
+  } finally {
+    client?.destroy();
+  }
 });

@@ -5213,18 +5213,18 @@ describe("HTTP server transport shutdown", () => {
   });
 
   it("waits for post-flush backpressure before running a write callback", async () => {
-    const body = Buffer.alloc(2 * 1024 * 1024, "x");
-    const writeReturned = Promise.withResolvers<boolean>();
+    const body = Buffer.alloc(8 * 1024 * 1024, "x");
+    const writeReturned = Promise.withResolvers<{ accepted: boolean; response: ServerResponse }>();
     const callback = Promise.withResolvers<Error | undefined>();
-    let callbackCalled = false;
+    let callbackCount = 0;
     const server = createServer((_req, res) => {
       res.writeHead(200, { "content-length": body.length });
       const accepted = res.write(body, error => {
-        callbackCalled = true;
+        callbackCount++;
         callback.resolve(error ?? undefined);
         res.destroy();
       });
-      writeReturned.resolve(accepted);
+      writeReturned.resolve({ accepted, response: res });
     });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -5240,11 +5240,16 @@ describe("HTTP server transport shutdown", () => {
     try {
       await once(client, "connect");
       client.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-      expect(await writeReturned.promise).toBe(false);
-      expect(callbackCalled).toBe(false);
+      const { accepted, response } = await writeReturned.promise;
+      expect(accepted).toBe(false);
+      // A false write can reflect only this turn's accounting, not transport backpressure.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(response.writableLength).toBeGreaterThan(0);
+      expect(callbackCount).toBe(0);
       client.resume();
       await closed.promise;
       expect(await callback.promise).toBeUndefined();
+      expect(callbackCount).toBe(1);
       const wire = Buffer.concat(chunks);
       const headerEnd = wire.indexOf("\r\n\r\n");
       expect(headerEnd).toBeGreaterThan(0);
@@ -5259,8 +5264,8 @@ describe("HTTP server transport shutdown", () => {
   });
 
   it("fails a buffered write callback when the peer resets before drain", async () => {
-    const body = Buffer.alloc(2 * 1024 * 1024, "x");
-    const writeReturned = Promise.withResolvers<boolean>();
+    const body = Buffer.alloc(8 * 1024 * 1024, "x");
+    const writeReturned = Promise.withResolvers<{ accepted: boolean; response: ServerResponse }>();
     const responseClosed = Promise.withResolvers<void>();
     const callbackErrors: string[] = [];
     const server = createServer((_req, res) => {
@@ -5268,7 +5273,7 @@ describe("HTTP server transport shutdown", () => {
       const accepted = res.write(body, (error: NodeJS.ErrnoException | null | undefined) => {
         callbackErrors.push(error?.code ?? "success");
       });
-      writeReturned.resolve(accepted);
+      writeReturned.resolve({ accepted, response: res });
     });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -5280,12 +5285,18 @@ describe("HTTP server transport shutdown", () => {
     try {
       await once(client, "connect");
       client.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-      expect(await writeReturned.promise).toBe(false);
+      const { accepted, response } = await writeReturned.promise;
+      expect(accepted).toBe(false);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(response.writableLength).toBeGreaterThan(0);
+      expect(callbackErrors).toHaveLength(0);
       client.resetAndDestroy();
       await responseClosed.promise;
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(callbackErrors).toHaveLength(1);
-      expect(["ERR_STREAM_DESTROYED", "ECONNRESET", "EPIPE"]).toContain(callbackErrors[0]);
+      // libuv cancels outstanding writes when the reset connection closes.
+      // https://github.com/nodejs/node/blob/v24.13.0/deps/uv/src/unix/stream.c#L428-L438
+      expect(["ERR_STREAM_DESTROYED", "ECONNRESET", "EPIPE", "ECANCELED"]).toContain(callbackErrors[0]);
     } finally {
       client.destroy();
       server.closeAllConnections();

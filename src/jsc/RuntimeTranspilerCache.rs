@@ -59,7 +59,9 @@ bun_core::declare_scope!(cache, visible);
 /// Version 29: `new Array(x, ...spread)` is no longer folded into an array literal.
 /// Version 30: String enum members are stored flat, so folds no longer append onto an inlined member.
 /// Version 31: Standard decorator lowering temporaries have a per-file counter in their name (`_init$1`).
-const EXPECTED_VERSION: u32 = 31;
+/// Version 32: Runtime plugin resolution is no longer stored in transpiler cache entries.
+/// Version 33: Preserve inferred names when inlining anonymous function and class initializers.
+const EXPECTED_VERSION: u32 = 33;
 
 /// Source files smaller than this are not written to / read from the on-disk
 /// transpiler cache. Originally 50 KiB, which excluded almost every file in a

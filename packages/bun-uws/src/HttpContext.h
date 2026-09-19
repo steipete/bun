@@ -741,6 +741,7 @@ private:
 
     template <bool IsNodeHttp>
     static us_socket_t *onWritable(us_socket_t *s) {
+        auto *socketGroup = us_socket_group(s);
         auto *asyncSocket = reinterpret_cast<AsyncSocket<SSL> *>(s);
         auto *httpResponseData = reinterpret_cast<HttpResponseData<SSL> *>(asyncSocket->getAsyncSocketData());
 
@@ -776,10 +777,6 @@ private:
 
         auto *httpContextData = getSocketContextDataS(s);
 
-
-        if (httpResponseData->isConnectRequest && httpResponseData->socketData && httpContextData->onSocketDrain) {
-            httpContextData->onSocketDrain(httpResponseData->socketData, SSL, (struct us_socket_t *) s);
-        }
         /* Ask the developer to write data and return success (true) or failure (false), OR skip sending anything and return success (true). */
         if (httpResponseData->onWritable) {
             /* We are now writable, so hang timeout again, the user does not have to do anything so we should hang until end or tryEnd rearms timeout */
@@ -790,6 +787,9 @@ private:
             /* We expect the developer to return whether or not write was successful (true).
              * If write was never called, the developer should still return true so that we may drain. */
             bool success = httpResponseData->callOnWritable(reinterpret_cast<HttpResponse<SSL> *>(asyncSocket), httpResponseData->offset);
+            if (us_socket_is_closed(s) || s->flags.adopted || us_socket_group(s) != socketGroup || us_socket_kind(s) != socketKind()) {
+                return us_internal_socket_follow_adopted(s);
+            }
 
             if constexpr (!IsNodeHttp) {
                 /* Bun.serve: onEnd deferred close for a tryEnd tail (offset < total,
@@ -828,6 +828,9 @@ private:
                  * reorders; the hook holds under backpressure and resumes raw reads only once
                  * the queue and spill drain (JSNodeHTTPServerSocket.cpp). */
                 Bun__NodeHTTP__onReadsResumable(SSL, s);
+                if (us_socket_is_closed(s) || s->flags.adopted || us_socket_group(s) != socketGroup || us_socket_kind(s) != socketKind()) {
+                    return us_internal_socket_follow_adopted(s);
+                }
             }
         }
 
@@ -851,11 +854,25 @@ private:
                 /* We need to force close after sending FIN since we want to hinder
                  * clients from keeping to send their huge data */
                 asyncSocket->close();
+                return us_internal_socket_follow_adopted(s);
             }
         }
 
         /* Expect another writable event, or another request within the timeout */
         reinterpret_cast<HttpResponse<SSL> *>(s)->resetTimeout();
+
+        /* The raw owner must observe the final HTTP/TLS flush. An Upgrade can
+         * already write raw bytes while its request body is still being read. */
+        bool drainRawSocket = httpResponseData->isConnectRequest;
+        if constexpr (IsNodeHttp) {
+            drainRawSocket |= (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_TUNNEL_LOOP_OWNED) != 0;
+        }
+        if (drainRawSocket && httpResponseData->socketData && httpContextData->onSocketDrain) {
+            httpContextData->onSocketDrain(httpResponseData->socketData, SSL, s);
+            /* The callback may close or adopt the socket; do not touch HTTP
+             * state again, including when adoption reused the allocation. */
+            return us_internal_socket_follow_adopted(s);
+        }
 
         return s;
     }

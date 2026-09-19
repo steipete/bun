@@ -330,8 +330,16 @@ function tlsVersionName(version) {
   }
 }
 
+function hasNativeHTTPParser(socket) {
+  return (
+    NodeHTTPServerSocket &&
+    socket instanceof NodeHTTPServerSocket &&
+    !(socket[kHandle]?.response?.flags & NodeHTTPResponseFlags.tunneled)
+  );
+}
+
 function connectionListener(this: Server, socket) {
-  if (NodeHTTPServerSocket && socket instanceof NodeHTTPServerSocket) return;
+  if (hasNativeHTTPParser(socket)) return;
   const tlsOptions = this[tlsSymbol];
   if (!tlsOptions) {
     connectionListenerHTTP1.$call(this, socket);
@@ -363,7 +371,7 @@ function connectionListener(this: Server, socket) {
 }
 
 function secureConnectionListener(this: Server, socket) {
-  if (NodeHTTPServerSocket && socket instanceof NodeHTTPServerSocket) return;
+  if (hasNativeHTTPParser(socket)) return;
   connectionListenerHTTP1.$call(this, socket);
 }
 
@@ -797,11 +805,7 @@ Server.prototype.listen = function () {
       try {
         startServerListen(server, tls, port, address, socketPath, serverNameHost);
       } catch (err) {
-        process.nextTick(
-          emitListenErrorNextTick,
-          server,
-          formatListenError(err, port, address, socketPath),
-        );
+        process.nextTick(emitListenErrorNextTick, server, formatListenError(err, port, address, socketPath));
       }
     });
     return this;
@@ -1709,6 +1713,8 @@ function getNodeHTTPServerSocket() {
     #pendingCallback = null;
     #pendingAbortMessage;
     #resetSupported;
+    // The accepting server owns connection accounting after parser handoff.
+    #connectionServer: Server | undefined = undefined;
     constructor(server: Server, handle, encrypted, listenerGeneration) {
       // Plain HTTP parser sockets stay half-open for CONNECT/Upgrade tunnels.
       // HTTPS sockets inherit tls.Server's half-open policy instead.
@@ -1727,6 +1733,7 @@ function getNodeHTTPServerSocket() {
       this._readableState.emitClose = true;
       this._writableState.decodeStrings = true;
       this.server = server;
+      this.#connectionServer = server;
       this.#resetSupported = !encrypted && !listenerGeneration?.isUnix;
       this[kHandle] = handle;
       this._secureEstablished = !!handle?.secureEstablished;
@@ -1807,7 +1814,6 @@ function getNodeHTTPServerSocket() {
         this.#pendingCallback = null;
         (callback as Function)();
       }
-      this.emit("drain");
     }
     #onData(chunk, last) {
       this._unrefTimer();
@@ -1819,12 +1825,6 @@ function getNodeHTTPServerSocket() {
         if (handle) {
           handle.ondata = undefined;
           this[kStreamingEnabled] = false;
-          // The peer finished its writable side of a CONNECT/Upgrade tunnel. The
-          // connection stays writable (allowHalfOpen), but - like Node, where the
-          // detached socket stops reading and no longer keeps the process alive -
-          // the never-used response for this request must not keep the event loop
-          // alive either.
-          handle.response?.unref();
         }
 
         this.push(null);
@@ -1852,12 +1852,13 @@ function getNodeHTTPServerSocket() {
       }
     }
     #onClose() {
+      const server = this.#connectionServer;
+      this.#connectionServer = undefined;
       const errored = this.errored;
       // freeParser equivalent: runs before 'close' listeners so they observe the
       // released parser (free() invoked, kOnTimeout nulled).
       releaseServerParserShim(this);
       this[kHandle] = null;
-      const server = this.server;
       const tracked = server?.[kTrackedConnections];
       if (tracked) {
         tracked.delete(this);
@@ -2098,6 +2099,7 @@ function getNodeHTTPServerSocket() {
     }
 
     ref() {
+      this[kHandle]?.ref();
       return this;
     }
 
@@ -2194,6 +2196,7 @@ function getNodeHTTPServerSocket() {
     }
 
     unref() {
+      this[kHandle]?.unref();
       return this;
     }
 

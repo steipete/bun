@@ -782,20 +782,23 @@ unsafe fn load_preloads(vm: *mut VirtualMachine) -> bun_jsc::CrateResult<*mut JS
         // SAFETY: `preload` points at a live boxed slice for this iteration
         // (heap-stable `Box<[u8]>` payload; nothing below mutates `vm.preload`).
         let preload_slice: &[u8] = unsafe { &*preload };
+        let is_require = i >= require_start && i < require_end;
         // Strip "file://".
         let normalized: &[u8] = preload_slice
             .strip_prefix(b"file://".as_slice())
             .unwrap_or(preload_slice);
 
-        // node: builtin specifiers bypass the file resolver — JSModuleLoader
-        // resolves them internally, so `bun --import node:*` works like Node's.
-        let module_name = if normalized.starts_with(b"node:") {
+        // ESM file URLs retain query and fragment identity in JSModuleLoader.
+        // node: builtin specifiers are also resolved there.
+        let module_name = if !is_require && preload_slice.starts_with(b"file:") {
+            bun_core::String::from_bytes(preload_slice)
+        } else if normalized.starts_with(b"node:") {
             bun_core::String::from_bytes(normalized)
         } else {
             // ── resolve ─────────────────────────────────────────────────────
             // SAFETY: per fn contract; `top_level_dir` is the `'static` fs
             // singleton field.
-            let import_kind = if i >= require_start && i < require_end {
+            let import_kind = if is_require {
                 ImportKind::Require
             } else {
                 ImportKind::Stmt
@@ -2712,6 +2715,8 @@ fn transpile_source_code_inner(
                     allow_bytecode_cache: true,
                     set_breakpoint_on_first_line,
                     runtime_transpiler_cache: if !disable_transpilying
+                        // SAFETY: per fn contract; hook output can retain importer-specific paths.
+                        && unsafe { (*jsc_vm).plugin_runner.is_none() }
                         && !<RuntimeTranspilerCache as bun_bundler::RuntimeTranspilerCacheExt>::disabled()
                     {
                         Some(&mut cache)

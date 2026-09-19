@@ -150,13 +150,17 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
          * shutdown sweep; the shouldCloseConnection() gates act on it once the
          * in-flight work completes. */
         HTTP_CLOSE_WHEN_IDLE = 1 << 17,
+        /* The raw CONNECT/Upgrade socket owns its loop lifetime. The HTTP
+         * connection filter consumes this token on close or WebSocket adoption. */
+        HTTP_NODE_TUNNEL_LOOP_OWNED = 1 << 18,
 
         /* Bits that describe the connection rather than the response in flight.
          * There is one HttpResponseData per socket, reused by every request on a
          * keep-alive connection, so starting a new response clears the rest of the
          * word (resetResponseState) - these have to survive that. */
         HTTP_CONNECTION_SCOPED = HTTP_NODE_PARSING_STOPPED | HTTP_NODE_READS_PAUSED
-            | HTTP_NODE_TUNNEL_AFTER_BODY | HTTP_NODE_RECEIVED_FIN | HTTP_CLOSE_WHEN_IDLE,
+            | HTTP_NODE_TUNNEL_AFTER_BODY | HTTP_NODE_RECEIVED_FIN | HTTP_CLOSE_WHEN_IDLE
+            | HTTP_NODE_TUNNEL_LOOP_OWNED,
     };
 
     /* Begin a new response on this connection. Clearing the word in one go is

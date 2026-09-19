@@ -32,7 +32,7 @@ use bun_uws as uws;
 use bun_uws_sys as uws_sys;
 use bun_uws_sys::app::c as uws_app_c;
 
-use bun_jsc::{JSGlobalObject, JSValue, JsResult};
+use bun_jsc::{JSGlobalObject, JSValue, JsCell, JsResult};
 
 // ─── httplog ─────────────────────────────────────────────────────────────────
 // Output.scoped(.Server, .visible) — debug-build no-op until bun_output wires.
@@ -259,6 +259,10 @@ pub struct NewServer<const SSL: bool, const DEBUG: bool> {
     /// ([`NewServer::is_drained`]); for Bun.serve it also holds the
     /// graceful-stop promise open ([`NewServer::is_closed`]).
     pub(crate) active_connection_count: core::cell::Cell<u32>,
+    /// Raw Node tunnels retain their accepted-connection count, but their
+    /// native socket owns loop activity after the HTTP parser hands off.
+    tunneled_connection_count: core::cell::Cell<u32>,
+    connection_adoption_depth: core::cell::Cell<u32>,
     /// Live `ServerWebSocket` count. Lives on the server (not the websocket
     /// context) so a reload's context swap cannot reset it, and sits in a
     /// `Cell` because the open/close accounting arrives through shared
@@ -284,7 +288,8 @@ pub struct NewServer<const SSL: bool, const DEBUG: bool> {
     /// promise in `deinit_if_we_can`, after which the Strong is dropped.
     pub(crate) all_closed_promise: jsc::JSPromiseStrong,
 
-    pub poll_ref: KeepAlive,
+    pub poll_ref: JsCell<KeepAlive>,
+    poll_ref_requested: core::cell::Cell<bool>,
 
     pub(crate) flags: ServerFlags,
 
@@ -483,7 +488,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
     /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
     /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
     extern "C" fn on_connection_filter(
-        _socket: *mut uws_sys::us_socket_t,
+        socket: *mut uws_sys::us_socket_t,
         opened: i32,
         user_data: *mut c_void,
     ) {
@@ -503,7 +508,19 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                 -2 => {}
                 _ => return,
             }
-            this.note_connection_closed() && !this.has_listener() && !this.deinit_running.get()
+            // Consume the connection-scoped token before uWS destroys or
+            // adopts the HTTP extension. Keep both counts coherent before
+            // running any drain/GC callback.
+            if this.config.is_node_http_server
+                && ffi::Bun__NodeHTTPServerSocket_takeTunnelLoopOwnership(SSL, socket)
+            {
+                let count = this.tunneled_connection_count.get();
+                debug_assert!(count > 0);
+                this.tunneled_connection_count.set(count - 1);
+            }
+            let drained = this.note_connection_closed();
+            this.refresh_node_http_loop_ref();
+            drained && !this.has_listener() && !this.deinit_running.get()
         };
         if drained {
             // SAFETY: no `&Self` outlives the block above; `deinit_running`
@@ -1589,8 +1606,8 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         self.active_sockets_count() > 0
     }
 
-    /// What the `stop()` promise (node:http: the `'close'` event) and the
-    /// loop unref wait for. Accepted connections count before a TLS handshake
+    /// What the `stop()` promise (node:http: the `'close'` event) waits for.
+    /// Accepted connections count before a TLS handshake
     /// completes, so a stopped listener cannot report closed while one can
     /// still dispatch.
     pub(crate) fn is_closed(&self) -> bool {
@@ -1598,6 +1615,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             && !self.has_listener()
             && !self.has_active_web_sockets()
             && !self.has_active_connections()
+            && self.connection_adoption_depth.get() == 0
     }
 
     /// Nothing is left that can dispatch a handler: [`Self::is_closed`] and
@@ -1637,17 +1655,54 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
     }
 
     pub fn ref_(&mut self) {
+        self.poll_ref_requested.set(true);
+        if self.config.is_node_http_server {
+            self.refresh_node_http_loop_ref();
+            return;
+        }
         // Once `is_closed()`, nothing is left that would ever `unref()` again
         // (`deinit_if_we_can` already dropped the loop ref), so a ref taken
         // here would pin the process forever.
-        if self.poll_ref.is_active() || self.is_closed() {
+        if self.poll_ref.get().is_active() || self.is_closed() {
             return;
         }
-        self.poll_ref.ref_(self.vm.loop_ctx());
+        self.poll_ref.with_mut(|r| r.ref_(self.vm.loop_ctx()));
     }
 
     pub(crate) fn unref(&mut self) {
-        self.poll_ref.unref(self.vm.loop_ctx());
+        self.poll_ref.with_mut(|r| r.unref(self.vm.loop_ctx()));
+    }
+
+    fn refresh_node_http_loop_ref(&self) {
+        if !self.config.is_node_http_server {
+            return;
+        }
+        // A raw tunnel can be half-open with no I/O left. It still delays
+        // close/GC, but only the socket's native activity may keep the loop
+        // alive. Ordinary HTTP and pre-handshake ownership stay here.
+        let has_work = self.has_listener()
+            || self.pending_requests.get() > 0
+            || self.has_active_web_sockets()
+            || self.active_connection_count.get() > self.tunneled_connection_count.get();
+        let keep_alive = self.connection_adoption_depth.get() > 0
+            || (self.poll_ref_requested.get()
+                && !self.flags.contains(ServerFlags::TERMINATED)
+                && has_work);
+        self.poll_ref.with_mut(|r| {
+            if keep_alive {
+                r.ref_(self.vm.loop_ctx());
+            } else {
+                r.unref(self.vm.loop_ctx());
+            }
+        });
+    }
+
+    fn on_tunnel_handoff(&self) {
+        debug_assert!(self.config.is_node_http_server);
+        let count = self.tunneled_connection_count.get() + 1;
+        debug_assert!(count <= self.active_connection_count.get());
+        self.tunneled_connection_count.set(count);
+        self.refresh_node_http_loop_ref();
     }
 
     pub(crate) fn stop_listening(&mut self, abrupt: bool) {
@@ -1809,7 +1864,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         // This replaces the old `!TERMINATED` proxy in `on_websocket_closed`,
         // which was permanent and so also blocked the *post*-stop close defer
         // that should fire the downgrade.
-        if self.deinit_running.get() {
+        if self.deinit_running.get() || self.connection_adoption_depth.get() > 0 {
             return;
         }
         self.deinit_running.set(true);
@@ -1880,7 +1935,9 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                 vm_ref,
             );
         }
-        if closed {
+        if self.config.is_node_http_server {
+            self.refresh_node_http_loop_ref();
+        } else if closed {
             self.unref();
         }
         if self.is_drained() {
@@ -2166,6 +2223,8 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             js_value: jsc::JsRef::empty(),
             pending_requests: core::cell::Cell::new(0),
             active_connection_count: core::cell::Cell::new(0),
+            tunneled_connection_count: core::cell::Cell::new(0),
+            connection_adoption_depth: core::cell::Cell::new(0),
             active_websocket_count: core::cell::Cell::new(0),
             deinit_running: core::cell::Cell::new(false),
             request_pool: <Self as ServerPools<SSL, DEBUG>>::request_pool(),
@@ -2173,7 +2232,8 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             // ~816 KB mux pool; `listen()` materializes it on demand.
             mux_request_pool: core::ptr::null_mut(),
             all_closed_promise: jsc::JSPromiseStrong::default(),
-            poll_ref: KeepAlive::default(),
+            poll_ref: JsCell::new(KeepAlive::default()),
+            poll_ref_requested: core::cell::Cell::new(false),
             flags: ServerFlags::default(),
             plugins: None,
             user_routes: Vec::new(),
@@ -3561,6 +3621,13 @@ mod ffi {
         );
         pub(super) safe fn NodeHTTP_assignOnNodeJSCompat(ssl: bool, app: *mut c_void);
 
+        // Only called by the live HTTP connection filter, before destruction
+        // or adoption of its extension. Does not invoke JS or a server callback.
+        pub(super) safe fn Bun__NodeHTTPServerSocket_takeTunnelLoopOwnership(
+            ssl: bool,
+            socket: *mut uws_sys::us_socket_t,
+        ) -> bool;
+
         /// `src/jsc/bindings/NodeHTTP.cpp` — constructs the JS
         /// `IncomingMessage`/`ServerResponse` pair, allocates a
         /// [`NodeHTTPResponse`] (returned via `node_response_ptr` with one ref
@@ -3833,6 +3900,27 @@ macro_rules! any_server_dispatch_mut {
     }};
 }
 
+/// Keeps the server alive while uWS replaces the HTTP connection with a
+/// WebSocket. The guard owns no Rust borrow across native callbacks.
+pub(crate) struct ConnectionAdoptionGuard(AnyServer);
+
+impl Drop for ConnectionAdoptionGuard {
+    fn drop(&mut self) {
+        let run_idle = any_server_dispatch!(&self.0, |s| {
+            let depth = s.connection_adoption_depth.get();
+            debug_assert!(depth > 0);
+            s.connection_adoption_depth.set(depth - 1);
+            s.refresh_node_http_loop_ref();
+            depth == 1 && !s.deinit_running.get()
+        });
+        if run_idle {
+            // Native adoption and all handler borrows have returned. The
+            // accepted/request or WebSocket counts still own the server.
+            any_server_dispatch_mut!(&self.0, |s| s.deinit_if_we_can());
+        }
+    }
+}
+
 /// Dispatch over the four `NewServer` monomorphizations, simultaneously
 /// downcasting an [`uws::AnyResponse`] to the matching `*mut Response<SSL>`.
 ///
@@ -3952,7 +4040,23 @@ impl AnyServer {
     }
 
     fn on_websocket_opened(&self) {
-        any_server_dispatch!(self, |s| s.note_websocket_opened());
+        any_server_dispatch!(self, |s| {
+            s.note_websocket_opened();
+            s.refresh_node_http_loop_ref();
+        });
+    }
+
+    pub(crate) fn on_tunnel_handoff(&self) {
+        any_server_dispatch!(self, |s| s.on_tunnel_handoff());
+    }
+
+    pub(crate) fn begin_connection_adoption(&self) -> ConnectionAdoptionGuard {
+        any_server_dispatch!(self, |s| {
+            s.connection_adoption_depth
+                .set(s.connection_adoption_depth.get() + 1);
+            s.refresh_node_http_loop_ref();
+        });
+        ConnectionAdoptionGuard(*self)
     }
 
     /// Decrement the live-socket count and, when the last socket drained on

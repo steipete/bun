@@ -32,6 +32,8 @@ JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketClose);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketReset);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketWrite);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketEnd);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketRef);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUnref);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUpgradeToTunnel);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketSetResponseTrailers);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketIsRequestTimedOut);
@@ -69,6 +71,8 @@ static const JSC::HashTableValue JSNodeHTTPServerSocketPrototypeTableValues[] = 
     { "reset"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketReset, 0 } },
     { "write"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketWrite, 2 } },
     { "end"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketEnd, 0 } },
+    { "ref"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketRef, 0 } },
+    { "unref"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketUnref, 0 } },
     { "upgradeToTunnel"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketUpgradeToTunnel, 0 } },
     { "setResponseTrailers"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketSetResponseTrailers, 1 } },
     { "isRequestTimedOut"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketIsRequestTimedOut, 2 } },
@@ -216,7 +220,24 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketWrite, (JSC::JSGlobalObje
         return JSValue::encode(JSC::jsNumber(0));
     }
 
+    JSNodeHTTPServerSocket::WriteScope writeScope(globalObject->vm(), *thisObject);
     return us_socket_buffered_js_write(thisObject->socket, thisObject->is_ssl, thisObject->ended, &thisObject->streamBuffer, globalObject, JSValue::encode(callFrame->argument(0)), JSValue::encode(callFrame->argument(1)));
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketRef, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    if (auto* thisObject = dynamicDowncast<JSNodeHTTPServerSocket>(callFrame->thisValue())) {
+        thisObject->setRef(true);
+    }
+    return JSValue::encode(JSC::jsUndefined());
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUnref, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    if (auto* thisObject = dynamicDowncast<JSNodeHTTPServerSocket>(callFrame->thisValue())) {
+        thisObject->setRef(false);
+    }
+    return JSValue::encode(JSC::jsUndefined());
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketEnd, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
@@ -229,6 +250,7 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketEnd, (JSC::JSGlobalObject
         return JSValue::encode(JSC::jsUndefined());
     }
 
+    JSNodeHTTPServerSocket::WriteScope writeScope(globalObject->vm(), *thisObject);
     thisObject->ended = true;
     // The response's buffered body must reach the kernel before the FIN; uWS
     // performs the shutdown after its send buffer drains.

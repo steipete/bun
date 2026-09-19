@@ -78,6 +78,7 @@ export const enum NodeHTTPResponseFlags {
   request_has_completed = 1 << 1,
   ended = 1 << 2,
   upgraded = 1 << 3,
+  tunneled = 1 << 8,
 
   closed_or_completed = socket_closed | request_has_completed,
 }

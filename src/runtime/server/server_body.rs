@@ -2737,6 +2737,7 @@ where
         callframe: &CallFrame,
     ) -> JsResult<JSValue> {
         let this_value = callframe.this();
+        self.poll_ref_requested.set(false);
         self.unref();
         Ok(this_value)
     }

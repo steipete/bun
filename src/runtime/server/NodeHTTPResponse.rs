@@ -194,6 +194,7 @@ unsafe extern "C" {
     // onReadsResumable replays what was parked, in order, before resuming reads.
     safe fn Bun__NodeHTTP__onReadsPaused(ssl: core::ffi::c_int, socket: *mut c_void);
     safe fn Bun__NodeHTTP__onReadsResumable(ssl: core::ffi::c_int, socket: *mut c_void);
+    safe fn Bun__NodeHTTPServerSocket_refreshTunnelLoopRef(ssl: bool, socket: *mut c_void);
 
     // Moves the connection's captured node:http request-trailer section out. `*out` points into
     // a C++ thread-local valid until the next call on this thread; caller copies immediately.
@@ -459,6 +460,10 @@ impl NodeHTTPResponse {
             return;
         }
         raw.pause();
+        Bun__NodeHTTPServerSocket_refreshTunnelLoopRef(
+            any_response_is_ssl(&raw),
+            raw.socket().cast(),
+        );
     }
 
     /* Pipelined flood prevention pauses READS on the connection, legal after the in-flight
@@ -571,6 +576,9 @@ impl NodeHTTPResponse {
             &upgrade_context.sec_websocket_key
         };
 
+        // uWS removes the HTTP accepted count before the WebSocket open
+        // callback adds its count. Preserve loop and GC ownership across it.
+        let _adoption = self.server.begin_connection_adoption();
         if let Some(raw_response) = self.raw_response.take() {
             self.update_flags(|f| f.insert(Flags::UPGRADED));
             // Unref the poll_ref since the socket is now upgraded to WebSocket
@@ -1308,12 +1316,15 @@ impl NodeHTTPResponse {
         self.update_flags(|f| f.insert(Flags::SOCKET_CLOSED));
     }
 
-    /// Flag-only: the pending-request release happens deterministically in
-    /// the dispatch tail (`on_node_http_request*` in `mod.rs`) or, for an
-    /// Upgrade with a body, at the body's fin chunk.
+    /// The native socket acquired loop ownership before calling this. Request
+    /// and body lifetime still end in the dispatch tail or at the body's fin.
     #[uws::uws_callback(export = "Bun__NodeHTTPResponse_markTunneled", no_catch)]
     pub(crate) fn mark_tunneled(&self) {
+        if self.flags.get().contains(Flags::TUNNELED) {
+            return;
+        }
         self.update_flags(|f| f.insert(Flags::TUNNELED));
+        self.server.on_tunnel_handoff();
     }
 
     fn on_timeout(&self, _resp: uws::AnyResponse) {

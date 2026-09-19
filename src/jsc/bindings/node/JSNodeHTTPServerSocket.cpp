@@ -110,13 +110,20 @@ static void upgradeToTunnelModeImpl(us_socket_t* socket, bool afterBody)
     } else {
         httpResponseData->isConnectRequest = true;
     }
+    httpResponseData->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_TUNNEL_LOOP_OWNED;
 }
 
 void JSNodeHTTPServerSocket::upgradeToTunnelMode(bool afterBody)
 {
-    if (!socket || us_socket_is_closed(socket)) {
+    if (upgraded || isClosed()) {
         return;
     }
+    const bool alreadyOwnsLoop = ownsTunnelLoop();
+    auto* response = currentResponseObject.get();
+    if (!alreadyOwnsLoop && (!response || !response->m_ctx)) {
+        return;
+    }
+    Strong<JSNodeHTTPServerSocket> protectedThis(globalObject()->vm(), this);
     /* Like Node's http server connections (allowHalfOpen: true): the peer
      * finishing its writable side ends the tunnel's readable side without
      * tearing the connection down, so the server can still write and decides
@@ -129,10 +136,109 @@ void JSNodeHTTPServerSocket::upgradeToTunnelMode(bool afterBody)
     } else {
         upgradeToTunnelModeImpl<false>(socket, afterBody);
     }
+    updateTunnelLoopRef();
     /* The exchange leaves HTTP here: let the response release the server's
      * pending-request accounting (see Flags::TUNNELED in NodeHTTPResponse.rs). */
-    if (auto* res = currentResponseObject.get(); res != nullptr && res->m_ctx != nullptr) {
-        Bun__NodeHTTPResponse_markTunneled(res->m_ctx);
+    if (!alreadyOwnsLoop) {
+        Bun__NodeHTTPResponse_markTunneled(response->m_ctx);
+    }
+    /* The HTTP parser normally uncorks at its dispatch tail. Flush that debt
+     * before raw writes bypass it; a synchronous uncork owes no drain event. */
+    if (!alreadyOwnsLoop && !isClosed()) {
+        if (is_ssl) {
+            reinterpret_cast<uWS::AsyncSocket<true>*>(socket)->uncork();
+        } else {
+            reinterpret_cast<uWS::AsyncSocket<false>*>(socket)->uncork();
+        }
+    }
+    updateTunnelLoopRef();
+}
+
+bool JSNodeHTTPServerSocket::ownsTunnelLoop() const
+{
+    if (upgraded || isClosed()) {
+        return false;
+    }
+    if (is_ssl) {
+        return reinterpret_cast<uWS::HttpResponseData<true>*>(us_socket_ext(socket))->state & uWS::HttpResponseData<true>::HTTP_NODE_TUNNEL_LOOP_OWNED;
+    }
+    return reinterpret_cast<uWS::HttpResponseData<false>*>(us_socket_ext(socket))->state & uWS::HttpResponseData<false>::HTTP_NODE_TUNNEL_LOOP_OWNED;
+}
+
+template<bool SSL>
+static bool hasPendingTunnelOutputImpl(us_socket_t* socket)
+{
+    auto* asyncSocket = reinterpret_cast<uWS::AsyncSocket<SSL>*>(socket);
+    if (!asyncSocket->hasFullyDrained()) {
+        return true;
+    }
+    auto* loopData = asyncSocket->getLoopData();
+    int slot = loopData->findCorkSlot(asyncSocket);
+    return slot != uWS::LoopData::INVALID_CORK_SLOT && loopData->getCorkSlot(slot)->offset > 0;
+}
+
+bool JSNodeHTTPServerSocket::hasPendingTunnelOutput() const
+{
+    return streamBuffer.bufferedSize() > 0
+        || (is_ssl ? hasPendingTunnelOutputImpl<true>(socket) : hasPendingTunnelOutputImpl<false>(socket));
+}
+
+void JSNodeHTTPServerSocket::setTunnelLoopRef(bool active)
+{
+    if (active == m_tunnelLoopRefActive) {
+        return;
+    }
+    m_tunnelLoopRefActive = active;
+    Bun__eventLoop__refKeepAlive(WebCore::clientData(vm())->bunVM, active ? 1 : -1);
+}
+
+void JSNodeHTTPServerSocket::updateTunnelLoopRef()
+{
+    // Pending writes are requests in libuv: socket.unref() only releases reads.
+    setTunnelLoopRef(ownsTunnelLoop()
+        && (m_tunnelWriteDepth > 0 || hasPendingTunnelOutput() || (m_refRequested && !m_tunnelReadEnded && !socket->flags.is_paused)));
+}
+
+void JSNodeHTTPServerSocket::setRef(bool refRequested)
+{
+    m_refRequested = refRequested;
+    updateTunnelLoopRef();
+}
+
+JSNodeHTTPServerSocket::WriteScope::WriteScope(JSC::VM& vm, JSNodeHTTPServerSocket& socket)
+    : m_socket(vm, &socket)
+{
+    ++socket.m_tunnelWriteDepth;
+    socket.updateTunnelLoopRef();
+}
+
+JSNodeHTTPServerSocket::WriteScope::~WriteScope()
+{
+    auto* socket = m_socket.get();
+    ASSERT(socket->m_tunnelWriteDepth > 0);
+    --socket->m_tunnelWriteDepth;
+    socket->updateTunnelLoopRef();
+}
+
+template<bool SSL>
+static void refreshTunnelLoopRef(us_socket_t* socket)
+{
+    socket = us_internal_socket_follow_adopted(socket);
+    if (!socket || us_socket_is_closed(socket) || us_socket_kind(socket) != (SSL ? US_SOCKET_KIND_UWS_HTTP_TLS : US_SOCKET_KIND_UWS_HTTP)) {
+        return;
+    }
+    auto* data = reinterpret_cast<uWS::HttpResponseData<SSL>*>(us_socket_ext(socket));
+    if (auto* wrapper = reinterpret_cast<JSNodeHTTPServerSocket*>(data->socketData)) {
+        wrapper->updateTunnelLoopRef();
+    }
+}
+
+extern "C" void Bun__NodeHTTPServerSocket_refreshTunnelLoopRef(bool isSSL, us_socket_t* socket)
+{
+    if (isSSL) {
+        refreshTunnelLoopRef<true>(socket);
+    } else {
+        refreshTunnelLoopRef<false>(socket);
     }
 }
 
@@ -379,6 +485,7 @@ const char* JSNodeHTTPServerSocket::peerCertificateVerificationError()
 
 JSNodeHTTPServerSocket::~JSNodeHTTPServerSocket()
 {
+    setTunnelLoopRef(false);
     if (socket) {
         if (is_ssl) {
             clearSocketData<true>(this->upgraded, socket);
@@ -399,6 +506,7 @@ JSNodeHTTPServerSocket::JSNodeHTTPServerSocket(JSC::VM& vm, JSC::Structure* stru
 
 void JSNodeHTTPServerSocket::detach()
 {
+    setTunnelLoopRef(false);
     this->m_duplex.clear();
     this->currentResponseObject.clear();
     {
@@ -421,6 +529,7 @@ void JSNodeHTTPServerSocket::appendPipelinedResponse(JSC::VM& vm, WebCore::JSNod
 template<bool SSL>
 static void replayNodeHttpPausedSpill(us_socket_t* socket)
 {
+    auto* socketGroup = us_socket_group(socket);
     auto* httpResponseData = reinterpret_cast<uWS::NodeHttpResponseData<SSL>*>(us_socket_ext(socket));
     httpResponseData->nodeHttpSpillReplayScheduled = false;
     /* Let the replay's own parse loop run; HTTP_NODE_READS_PAUSED stays set so
@@ -432,11 +541,14 @@ static void replayNodeHttpPausedSpill(us_socket_t* socket)
         size_t spillLength = spill.size();
         spill.grow(spillLength + LIBUS_RECV_BUFFER_PADDING);
         us_socket_t* returned = uWS::HttpContext<SSL>::feedNodeHttpData(socket, spill.mutableSpan().data(), (int)spillLength);
-        if (!returned || us_socket_is_closed(returned)) {
+        returned = us_internal_socket_follow_adopted(returned);
+        if (!returned || us_socket_is_closed(returned) || us_socket_group(returned) != socketGroup
+            || us_socket_kind(returned) != (SSL ? US_SOCKET_KIND_UWS_HTTP_TLS : US_SOCKET_KIND_UWS_HTTP)) {
             return;
         }
         socket = returned;
         httpResponseData = reinterpret_cast<uWS::NodeHttpResponseData<SSL>*>(us_socket_ext(socket));
+        refreshTunnelLoopRef<SSL>(socket);
     }
     if (httpResponseData->nodeHttpParkAtNextBoundary) {
         /* A dispatch during the replay hit backpressure again and re-parked
@@ -451,6 +563,7 @@ static void replayNodeHttpPausedSpill(us_socket_t* socket)
     }
     httpResponseData->state &= ~uWS::HttpResponseData<SSL>::HTTP_NODE_READS_PAUSED;
     reinterpret_cast<uWS::HttpResponse<SSL>*>(socket)->resume();
+    refreshTunnelLoopRef<SSL>(socket);
 }
 
 template<bool SSL>
@@ -473,6 +586,7 @@ static void onNodeHttpReadsResumable(us_socket_t* socket)
         httpResponseData->nodeHttpParkAtNextBoundary = false;
         httpResponseData->state &= ~uWS::HttpResponseData<SSL>::HTTP_NODE_READS_PAUSED;
         reinterpret_cast<uWS::HttpResponse<SSL>*>(socket)->resume();
+        refreshTunnelLoopRef<SSL>(socket);
         return;
     }
     if (httpResponseData->nodeHttpSpillReplayScheduled) {
@@ -496,7 +610,8 @@ static void onNodeHttpReadsResumable(us_socket_t* socket)
     scriptExecutionContext->postTask([protectedSocket = std::move(protectedSocket)](WebCore::ScriptExecutionContext&) {
         auto* self = protectedSocket.get();
         us_socket_t* sock = self->socket;
-        if (!sock || us_socket_is_closed(sock)) {
+        if (self->upgraded || !sock || us_socket_is_closed(sock)) {
+            self->updateTunnelLoopRef();
             return;
         }
         if (self->is_ssl) {
@@ -515,6 +630,7 @@ static void onNodeHttpReadsPaused(us_socket_t* socket)
     auto* d = reinterpret_cast<uWS::NodeHttpResponseData<SSL>*>(us_socket_ext(socket));
     d->nodeHttpParkAtNextBoundary = true;
     d->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_READS_PAUSED;
+    refreshTunnelLoopRef<SSL>(socket);
 }
 
 extern "C" void Bun__NodeHTTP__onReadsPaused(int ssl, us_socket_t* socket)
@@ -642,6 +758,7 @@ static void notifyResponsesOnClose(JSNodeHTTPServerSocket* socket)
 
 void JSNodeHTTPServerSocket::onClose()
 {
+    setTunnelLoopRef(false);
     syncPeerCertificateVerification();
     this->socket = nullptr;
     if (auto* res = this->currentResponseObject.get(); res != nullptr && res->m_ctx != nullptr) {
@@ -714,9 +831,11 @@ void JSNodeHTTPServerSocket::onDrain()
 {
     // This function can be called during GC!
     Zig::GlobalObject* globalObject = static_cast<Zig::GlobalObject*>(this->globalObject());
-    if (!functionToCallOnDrain) {
+    if (isClosed()) {
+        updateTunnelLoopRef();
         return;
     }
+    WriteScope writeScope(globalObject->vm(), *this);
 
     auto bufferedSize = this->streamBuffer.bufferedSize();
     if (bufferedSize > 0) {
@@ -736,20 +855,24 @@ void JSNodeHTTPServerSocket::onDrain()
             return;
         }
     }
+    if ((ownsTunnelLoop() && hasPendingTunnelOutput()) || !functionToCallOnDrain) {
+        return;
+    }
     WebCore::ScriptExecutionContext* scriptExecutionContext = globalObject->scriptExecutionContext();
 
     if (scriptExecutionContext) {
-        scriptExecutionContext->postTask([self = this](ScriptExecutionContext& context) {
+        scriptExecutionContext->postTask([protectedThis = Strong<JSNodeHTTPServerSocket>(globalObject->vm(), this)](ScriptExecutionContext& context) {
             WTF::NakedPtr<JSC::Exception> exception;
             auto* globalObject = defaultGlobalObject(context.globalObject());
-            auto* thisObject = self;
+            auto* thisObject = protectedThis.get();
             auto* callbackObject = thisObject->functionToCallOnDrain.get();
-            if (!callbackObject) {
+            // An earlier drain task can run JS that queues another write.
+            if (!callbackObject || thisObject->isClosed() || thisObject->upgraded
+                || (thisObject->ownsTunnelLoop() && thisObject->hasPendingTunnelOutput())) {
                 return;
             }
             auto callData = JSC::getCallData(callbackObject);
             MarkedArgumentBuffer args;
-            EnsureStillAliveScope ensureStillAlive(self);
 
             if (globalObject->scriptExecutionStatus(globalObject, thisObject) == ScriptExecutionStatus::Running) {
                 profiledCall(globalObject, JSC::ProfilingReason::API, callbackObject, callData, thisObject, args, exception);
@@ -767,6 +890,10 @@ void JSNodeHTTPServerSocket::onData(const char* data, int length, bool last)
 {
     // This function can be called during GC!
     Zig::GlobalObject* globalObject = static_cast<Zig::GlobalObject*>(this->globalObject());
+    if (last) {
+        m_tunnelReadEnded = true;
+        updateTunnelLoopRef();
+    }
     if (!functionToCallOnData) {
         return;
     }
@@ -776,30 +903,25 @@ void JSNodeHTTPServerSocket::onData(const char* data, int length, bool last)
     if (scriptExecutionContext) {
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(globalObject->vm());
         JSC::JSUint8Array* buffer = WebCore::createBuffer(globalObject, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data), length));
-        auto chunk = JSC::JSValue(buffer);
         if (auto* exception = scope.exception()) {
             (void)scope.tryClearException();
             globalObject->reportUncaughtExceptionAtEventLoop(globalObject, exception);
             RETURN_IF_EXCEPTION(scope, );
             return;
         }
-        gcProtect(chunk);
-        scriptExecutionContext->postTask([self = this, chunk = chunk, last = last](ScriptExecutionContext& context) {
+        scriptExecutionContext->postTask([protectedThis = Strong<JSNodeHTTPServerSocket>(globalObject->vm(), this), protectedChunk = Strong<JSC::JSUint8Array>(globalObject->vm(), buffer), last](ScriptExecutionContext& context) {
             WTF::NakedPtr<JSC::Exception> exception;
             auto* globalObject = defaultGlobalObject(context.globalObject());
-            auto* thisObject = self;
+            auto* thisObject = protectedThis.get();
             auto* callbackObject = thisObject->functionToCallOnData.get();
-            EnsureStillAliveScope ensureChunkStillAlive(chunk);
-            gcUnprotect(chunk);
             if (!callbackObject) {
                 return;
             }
 
             auto callData = JSC::getCallData(callbackObject);
             MarkedArgumentBuffer args;
-            args.append(chunk);
+            args.append(JSC::JSValue(protectedChunk.get()));
             args.append(JSC::jsBoolean(last));
-            EnsureStillAliveScope ensureStillAlive(self);
 
             if (globalObject->scriptExecutionStatus(globalObject, thisObject) == ScriptExecutionStatus::Running) {
                 profiledCall(globalObject, JSC::ProfilingReason::API, callbackObject, callData, thisObject, args, exception);
@@ -854,6 +976,25 @@ static JSNodeHTTPServerSocket* getNodeHTTPServerSocket(us_socket_t* socket)
 {
     auto* httpResponseData = (uWS::HttpResponseData<SSL>*)us_socket_ext(socket);
     return reinterpret_cast<JSNodeHTTPServerSocket*>(httpResponseData->socketData);
+}
+
+template<bool SSL>
+static bool takeTunnelLoopOwnership(us_socket_t* socket)
+{
+    auto* data = reinterpret_cast<uWS::HttpResponseData<SSL>*>(us_socket_ext(socket));
+    if (!(data->state & uWS::HttpResponseData<SSL>::HTTP_NODE_TUNNEL_LOOP_OWNED)) {
+        return false;
+    }
+    data->state &= ~uWS::HttpResponseData<SSL>::HTTP_NODE_TUNNEL_LOOP_OWNED;
+    if (auto* wrapper = reinterpret_cast<JSNodeHTTPServerSocket*>(data->socketData)) {
+        wrapper->updateTunnelLoopRef();
+    }
+    return true;
+}
+
+extern "C" bool Bun__NodeHTTPServerSocket_takeTunnelLoopOwnership(bool isSSL, us_socket_t* socket)
+{
+    return isSSL ? takeTunnelLoopOwnership<true>(socket) : takeTunnelLoopOwnership<false>(socket);
 }
 
 template<bool SSL>

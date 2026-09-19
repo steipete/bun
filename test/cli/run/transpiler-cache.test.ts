@@ -12,7 +12,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { bunEnv, bunExe, bunRun, isWindows, tmpdirSync } from "harness";
+import { bunEnv, bunExe, bunRun, isWindows, tempDir, tmpdirSync } from "harness";
 import { mkfifo } from "mkfifo";
 import { join } from "path";
 
@@ -135,6 +135,61 @@ describe("transpiler cache", () => {
     writeFileSync(join(temp_dir, "b.js"), dummyFile(50 * 1024, "1", "b"));
     expect(await bunRun(join(temp_dir, "b.js"), env)).toSpawn("b");
     expect(newCacheCount()).toBe(0);
+  });
+  describe("runtime plugin resolution", () => {
+    function fixture(main: string) {
+      // Both copies exceed the 4 KiB cache threshold and have identical source bytes.
+      const moduleSource = `import { value } from "./api.js"; export { value };\n//${Buffer.alloc(4 * 1024, "x").toString()}`;
+      return tempDir("runtime-plugin-cache", {
+        "package.json": '{"type":"module"}',
+        "first/index.js": moduleSource,
+        "first/api.js": "export const value = 1;",
+        "second/index.js": moduleSource,
+        "second/api.js": "export const value = 2;",
+        "plugin.mjs": `import { dirname, resolve } from "node:path";
+          Bun.plugin({ name: "relative-peer", setup(build) {
+            build.onResolve({ filter: /^\\.\\//, namespace: "file" }, ({ path, importer }) => ({
+              path: resolve(dirname(importer), path), namespace: "file",
+            }));
+          }});`,
+        "main.mjs": main,
+      });
+    }
+
+    test.each(["require", "import"])("resolves identical modules from each generation via %s", async mode => {
+      using dir = fixture(`import "./plugin.mjs";
+        import { createRequire } from "node:module";
+        import { rmSync } from "node:fs";
+        import { join, sep } from "node:path";
+        import { pathToFileURL } from "node:url";
+        const require = createRequire(import.meta.url);
+        for (const generation of ["first", "second"]) {
+          const directory = join(import.meta.dir, generation);
+          const entry = join(directory, "index.js");
+          const loaded = ${mode === "require" ? "require(entry)" : "await import(pathToFileURL(entry).href)"};
+          console.log(loaded.value);
+          for (const file of Object.keys(require.cache)) {
+            if (file.startsWith(directory + sep)) delete require.cache[file];
+          }
+          rmSync(directory, { recursive: true });
+        }`);
+      expect(
+        await bunRun(join(String(dir), "main.mjs"), {
+          ...env,
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: join(String(dir), ".cache"),
+        }),
+      ).toSpawn("1\n2");
+    });
+
+    test("does not leave hook-resolved paths for a later process without plugins", async () => {
+      using dir = fixture(`import "./plugin.mjs";
+        console.log(require("./first/index.js").value);`);
+      const cacheEnv = { ...env, BUN_RUNTIME_TRANSPILER_CACHE_PATH: join(String(dir), ".cache") };
+      expect(await bunRun(join(String(dir), "main.mjs"), cacheEnv)).toSpawn("1");
+      rmSync(join(String(dir), "first"), { recursive: true });
+      writeFileSync(join(String(dir), "plain.mjs"), 'console.log(require("./second/index.js").value);');
+      expect(await bunRun(join(String(dir), "plain.mjs"), cacheEnv)).toSpawn("2");
+    });
   });
   test("doing 50 buns at once does not crash", async () => {
     writeFileSync(join(temp_dir, "a.js"), dummyFile(50 * 1024, "1", "b"));
