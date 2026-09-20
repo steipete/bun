@@ -132,7 +132,7 @@ export function write(this: Console, input) {
     wrote += writer.write(arguments[i]);
   }
 
-  writer.flush(true);
+  writer.flush();
   return wrote;
 }
 
