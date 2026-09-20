@@ -115,6 +115,9 @@ public:
      * body deliver it through the request first, like Node 26). */
     void upgradeToTunnelMode(bool afterBody = false);
 
+    /* Apply Node stream read backpressure to a raw CONNECT/Upgrade tunnel.
+     * HTTP request bodies and native WebSockets keep their existing owners. */
+    void setRawReadPaused(bool);
     void setRef(bool);
     void updateTunnelLoopRef();
 

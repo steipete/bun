@@ -34,6 +34,7 @@ JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketWrite);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketEnd);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketRef);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUnref);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketSetRawReadPaused);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUpgradeToTunnel);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketSetResponseTrailers);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketIsRequestTimedOut);
@@ -73,6 +74,7 @@ static const JSC::HashTableValue JSNodeHTTPServerSocketPrototypeTableValues[] = 
     { "end"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketEnd, 0 } },
     { "ref"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketRef, 0 } },
     { "unref"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketUnref, 0 } },
+    { "setRawReadPaused"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketSetRawReadPaused, 1 } },
     { "upgradeToTunnel"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketUpgradeToTunnel, 0 } },
     { "setResponseTrailers"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketSetResponseTrailers, 1 } },
     { "isRequestTimedOut"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function | JSC::PropertyAttribute::DontEnum), JSC::NoIntrinsic, { JSC::HashTableValue::NativeFunctionType, jsFunctionNodeHTTPServerSocketIsRequestTimedOut, 2 } },
@@ -236,6 +238,14 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketUnref, (JSC::JSGlobalObje
 {
     if (auto* thisObject = dynamicDowncast<JSNodeHTTPServerSocket>(callFrame->thisValue())) {
         thisObject->setRef(false);
+    }
+    return JSValue::encode(JSC::jsUndefined());
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketSetRawReadPaused, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    if (auto* thisObject = dynamicDowncast<JSNodeHTTPServerSocket>(callFrame->thisValue())) {
+        thisObject->setRawReadPaused(callFrame->argument(0).toBoolean(globalObject));
     }
     return JSValue::encode(JSC::jsUndefined());
 }

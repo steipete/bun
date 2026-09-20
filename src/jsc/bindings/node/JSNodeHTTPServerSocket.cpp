@@ -205,6 +205,19 @@ void JSNodeHTTPServerSocket::setRef(bool refRequested)
     updateTunnelLoopRef();
 }
 
+void JSNodeHTTPServerSocket::setRawReadPaused(bool paused)
+{
+    if (!ownsTunnelLoop()) {
+        return;
+    }
+    if (paused) {
+        us_socket_pause(socket);
+    } else {
+        us_socket_resume(socket);
+    }
+    updateTunnelLoopRef();
+}
+
 JSNodeHTTPServerSocket::WriteScope::WriteScope(JSC::VM& vm, JSNodeHTTPServerSocket& socket)
     : m_socket(vm, &socket)
 {

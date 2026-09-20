@@ -1818,7 +1818,9 @@ function getNodeHTTPServerSocket() {
     #onData(chunk, last) {
       this._unrefTimer();
       if (chunk) {
-        this.push(chunk);
+        if (!this.push(chunk)) {
+          this[kHandle]?.setRawReadPaused(true);
+        }
       }
       if (last) {
         const handle = this[kHandle];
@@ -2035,28 +2037,37 @@ function getNodeHTTPServerSocket() {
         // socket does not end when the request body does.
         if (response) {
           const resumed = response.resume();
+          handle?.setRawReadPaused(false);
           if (resumed && resumed !== true) {
             upgradeIncoming.push(resumed);
           }
+        } else {
+          handle?.setRawReadPaused(false);
         }
         upgradeIncoming.resume();
         return;
       }
+      let resumed;
       if (response) {
-        const resumed = response.resume();
-        if (resumed && resumed !== true) {
-          const bodyReadState = handle.hasBody;
+        resumed = response.resume();
+      }
+      // Request-body replay above must run before fresh transport reads. Rearm
+      // before push(), whose synchronous data listeners may pause us again.
+      handle?.setRawReadPaused(false);
+      if (resumed && resumed !== true) {
+        const bodyReadState = handle.hasBody;
 
-          const message = this._httpMessage;
-          const req = message?.req;
+        const message = this._httpMessage;
+        const req = message?.req;
 
-          if ((bodyReadState & NodeHTTPBodyReadState.done) !== 0) {
-            emitServerSocketEOFNT(this, req);
-          }
-          if (req) {
-            req.push(resumed);
-          }
-          this.push(resumed);
+        if ((bodyReadState & NodeHTTPBodyReadState.done) !== 0) {
+          emitServerSocketEOFNT(this, req);
+        }
+        if (req) {
+          req.push(resumed);
+        }
+        if (!this.push(resumed)) {
+          handle?.setRawReadPaused(true);
         }
       }
     }
@@ -2227,13 +2238,15 @@ function getNodeHTTPServerSocket() {
       if (response) {
         response.pause();
       }
-
-      return super.pause();
+      const result = super.pause();
+      handle?.setRawReadPaused(this.isPaused());
+      return result;
     }
 
     resume() {
+      const result = super.resume();
       this.#resumeSocket();
-      return super.resume();
+      return result;
     }
 
     get [kInternalSocketData]() {
