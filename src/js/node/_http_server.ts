@@ -2238,9 +2238,7 @@ function getNodeHTTPServerSocket() {
       if (response) {
         response.pause();
       }
-      const result = super.pause();
-      handle?.setRawReadPaused(this.isPaused());
-      return result;
+      return super.pause();
     }
 
     resume() {
