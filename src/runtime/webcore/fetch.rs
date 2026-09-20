@@ -920,9 +920,10 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                                     proxy_arg.get(global_this, "headers")?
                                 {
                                     if !headers_value.is_undefined_or_null() {
-                                        if let Some(fetch_hdrs) = FetchHeaders::cast(headers_value)
+                                        if let Some(fetch_hdrs) =
+                                            FetchHeaders::cast_as_init(headers_value)
                                         {
-                                            // `cast` returns a live JS-owned FetchHeaders*;
+                                            // `cast_as_init` returns a live JS-owned FetchHeaders*;
                                             // BackRef invariant holds for this read.
                                             let fetch_hdrs = bun_ptr::BackRef::from(fetch_hdrs);
                                             proxy_headers =
@@ -1108,7 +1109,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                     options.fast_get(global_this, jsc::BuiltinName::Headers)?
                 {
                     if !headers_value.is_undefined() {
-                        if let Some(headers__) = FetchHeaders::cast(headers_value) {
+                        if let Some(headers__) = FetchHeaders::cast_as_init(headers_value) {
                             // `FetchHeaders` is an opaque ZST FFI handle (S008) — safe deref.
                             if bun_opaque::opaque_deref_mut(headers__.as_ptr()).is_empty() {
                                 break 'brk None;
@@ -1137,7 +1138,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                     options.fast_get(global_this, jsc::BuiltinName::Headers)?
                 {
                     if !headers_value.is_undefined() {
-                        if let Some(headers__) = FetchHeaders::cast(headers_value) {
+                        if let Some(headers__) = FetchHeaders::cast_as_init(headers_value) {
                             // `FetchHeaders` is an opaque ZST FFI handle (S008) — safe deref.
                             if bun_opaque::opaque_deref_mut(headers__.as_ptr()).is_empty() {
                                 break 'brk None;
