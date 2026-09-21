@@ -1,12 +1,60 @@
 /**
  * This test must also pass in Node.js.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, onTestFinished, test } from "bun:test";
 import { once } from "node:events";
-import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { createServer, IncomingMessage, request, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { connect } from "node:net";
 import { duplexPair } from "node:stream";
+
+test.concurrent("SSE response close can remove the request error listener during client cancellation", async () => {
+  const events: string[] = [];
+  const requestClosed = Promise.withResolvers<void>();
+  const server = createServer((req, res) => {
+    const onError = (error: NodeJS.ErrnoException) => events.push(`req.error:${error.code}`);
+    req.on("aborted", () => events.push("req.aborted"));
+    req.on("error", onError);
+    req.on("close", () => {
+      events.push("req.close");
+      requestClosed.resolve();
+    });
+    res.on("close", () => {
+      events.push("res.close");
+      req.off("error", onError);
+    });
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: ready\n\n");
+  });
+  let client: ReturnType<typeof request> | undefined;
+  onTestFinished(async () => {
+    client?.destroy();
+    server.closeAllConnections();
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close(error => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  client = request({ host: "127.0.0.1", port, path: "/" });
+  const responseReady = once(client, "response");
+  client.end();
+  const [response] = await responseReady;
+  let chunk: Buffer | null;
+  while ((chunk = response.read(Buffer.byteLength("data: ready\n\n"))) === null) {
+    await once(response, "readable");
+  }
+  expect(chunk.toString()).toBe("data: ready\n\n");
+  const responseClosed = once(response, "close");
+  response.destroy();
+  await Promise.all([requestClosed.promise, responseClosed]);
+
+  expect(events).toEqual(["req.aborted", "res.close", "req.close"]);
+});
 
 test("aborted request body emits 'error' ECONNRESET and res 'close' before req 'close'", async () => {
   // Like Node.js's socketOnClose → abortIncoming: the aborted request is

@@ -1842,9 +1842,8 @@ function getNodeHTTPServerSocket() {
       this[kHandle] = undefined;
       // Capture the in-flight response before detachSocket() can clear it: a
       // synchronous res.destroy() inside the request handler runs detachSocket()
-      // between here and the native close delivering #onClose. The abort itself
-      // is deferred to #onClose so the dispatch promise resolves only after the
-      // native on_abort has released the pending-request ref.
+      // between here and the native close delivering #onClose. Request abort
+      // waits for public socket close, after native on_abort released its ref.
       this.#pendingAbortMessage = this._httpMessage;
       handle.onclose = this.#onCloseForDestroy.bind(this, callback, err);
       if (this.resetAndClosing) {
@@ -1910,29 +1909,27 @@ function getNodeHTTPServerSocket() {
         failPendingWriteCallbacks(message, writeFailure);
       }
       const req = message?.req;
-
-      // Node emits the response close from its first socket close listener.
-      // Snapshot the still-attached response before request destruction can
-      // detach it, and preserve EventEmitter's current-emission semantics when
-      // a response close listener removes a later socket close listener.
-      if (message && !message._closed) {
-        this.prependOnceListener("close", emitCloseNT.bind(undefined, message));
-      }
-
-      if (req && !req.destroyed && !req[kHandle]?.upgraded) {
-        // At this point the socket is already destroyed; let's avoid UAF
+      const abortRequest = req && !req.destroyed && !req[kHandle]?.upgraded;
+      if (abortRequest) {
         req[kHandle] = undefined;
-        if (req.listenerCount("error") > 0) {
-          req.destroy(new ConnResetException("aborted"));
-        } else {
-          req.destroy();
-        }
       }
+      const pipelined = detachQueuedPipelinedResponses(this);
 
-      // Pipelined responses (and their requests) that were still queued behind
-      // the in-flight response are aborted, like Node.js's socketOnClose
-      // (abortIncoming + abortOutgoing).
-      abortQueuedPipelinedResponses(this, writeFailure);
+      // Node aborts requests inside socket 'close', before response close listeners.
+      // Otherwise IncomingMessage checks its error listeners one tick too early:
+      // response cleanup can remove them before the queued error is emitted.
+      // https://github.com/nodejs/node/blob/v26.8.2/lib/_http_server.js#L912-L923
+      if (message || pipelined?.length) {
+        this.prependOnceListener("close", () => {
+          if (abortRequest && !req.destroyed) {
+            req.destroy(req.listenerCount("error") > 0 ? new ConnResetException("aborted") : undefined);
+          }
+          abortQueuedPipelinedResponses(pipelined, writeFailure);
+          if (message && !message._closed) {
+            emitCloseNT(message);
+          }
+        });
+      }
 
       // Node's server connection socket emits 'close' whenever the TCP
       // connection closes, even with no request in flight (this also covers
@@ -2807,21 +2804,29 @@ function queuePipelinedResponse(socket, res, isAncient) {
   (socket[kPipelinedResponses] ??= []).push(res);
 }
 
-// When the connection dies with pipelined responses still queued behind the
-// in-flight one, abort them and their requests, like Node.js's socketOnClose
-// (abortIncoming). Runs from the native socket's close path and from the
-// http1 fallback's socket 'close' listener.
-function abortQueuedPipelinedResponses(socket, error = $ERR_STREAM_DESTROYED("write")) {
+// Native handles are invalid before the socket's public close notification.
+function detachQueuedPipelinedResponses(socket) {
   const pipelined = socket[kPipelinedResponses];
+  socket[kPipelinedResponses] = undefined;
+  const length = pipelined ? pipelined.length : 0;
+  for (let i = 0; i < length; i++) {
+    const req = pipelined[i].req;
+    if (req && !req.destroyed) {
+      req[kHandle] = undefined;
+    }
+  }
+  return pipelined;
+}
+
+// Both native and HTTP/1 fallback sockets abort their queued responses during 'close'.
+function abortQueuedPipelinedResponses(pipelined, error = $ERR_STREAM_DESTROYED("write")) {
   const pipelinedLength = pipelined ? pipelined.length : 0;
   if (pipelinedLength) {
-    socket[kPipelinedResponses] = undefined;
     for (let i = 0; i < pipelinedLength; i++) {
       const queuedRes = pipelined[i];
       const queuedReq = queuedRes.req;
       failQueuedPipelinedWriteCallbacks(queuedRes[kPipelinedQueuedState], error);
       if (queuedReq && !queuedReq.destroyed) {
-        queuedReq[kHandle] = undefined;
         if (queuedReq.listenerCount("error") > 0) {
           queuedReq.destroy(new ConnResetException("aborted"));
         } else {
@@ -4202,7 +4207,8 @@ function storeHTTPOptions(options) {
 // internal/http instead of the user-visible module exports.
 http1ServerPipeline.queuePipelinedResponse = queuePipelinedResponse;
 http1ServerPipeline.advanceResponsePipeline = advanceResponsePipeline;
-http1ServerPipeline.abortQueuedPipelinedResponses = abortQueuedPipelinedResponses;
+http1ServerPipeline.abortQueuedPipelinedResponses = (socket, error) =>
+  abortQueuedPipelinedResponses(detachQueuedPipelinedResponses(socket), error);
 http1ServerPipeline.maybePauseFallbackReads = maybePauseFallbackReads;
 http1ServerPipeline.resumeFallbackReadsOnDrain = resumeFallbackReadsOnDrain;
 http1ServerPipeline.kMustCloseConnection = kMustCloseConnection;
