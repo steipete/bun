@@ -78,6 +78,7 @@ class GlobalObject;
 
 namespace Bun {
 class StrongRootBlock;
+class WorkerHeapLimitObserver;
 
 // JSC measures the live size of the heap at the end of each collection, but only
 // publishes it per scope: an eden collection updates
@@ -215,6 +216,11 @@ public:
     // `worker` is the WorkerMessagingProxy this VM is being created for, or null on the main thread.
     static void create(JSC::VM*, void* bunVM, WorkerMessagingProxy* worker);
 
+    // Called under the worker API lock after publishing its VM handle, and
+    // before withdrawing that handle at shutdown, respectively.
+    void startWorkerHeapLimit(JSC::VM&, const void* worker);
+    void stopWorkerHeapLimit();
+
     JSHeapData& heapData() { return *m_heapData; }
     BunBuiltinNames& builtinNames() { return m_builtinNames; }
     JSBuiltinFunctions& builtinFunctions() { return *m_builtinFunctions; }
@@ -327,6 +333,7 @@ private:
     WebCore::DOMURLBaseCache m_urlBaseCache;
 
     Bun::HeapSizeAfterLastCollection m_heapSizeAfterLastCollection;
+    std::unique_ptr<Bun::WorkerHeapLimitObserver> m_workerHeapLimitObserver;
 
     SentinelLinkedList<JSVMClientDataClient, BasicRawSentinelNode<JSVMClientDataClient>> m_clients;
     bool m_isWorkerVM { false };

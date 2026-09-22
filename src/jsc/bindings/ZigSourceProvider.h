@@ -38,6 +38,10 @@ public:
     ~SourceProvider();
     unsigned hash() const override;
     StringView source() const override;
+    const WTF::StringImpl* sourceStringImplForOldGenerationAccounting() const final
+    {
+        return &m_source.get();
+    }
 
     RefPtr<JSC::CachedBytecode> cachedBytecode() const final
     {

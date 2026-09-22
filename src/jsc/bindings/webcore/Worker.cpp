@@ -147,7 +147,7 @@ void Worker::dispatchEvent(Event& event)
     EventTargetWithInlineData::dispatchEvent(event);
 }
 
-void Worker::dispatchCloseEvent(Event& event)
+void Worker::dispatchFinalEvent(Event& event)
 {
     EventTargetWithInlineData::dispatchEvent(event);
 }
@@ -194,9 +194,9 @@ extern "C" void WebWorker__workerGlobalScopeStarted(WorkerMessagingProxy* proxy,
     proxy->workerGlobalScopeStarted(*globalObject);
 }
 
-extern "C" void WebWorker__workerGlobalScopeDestroyed(WorkerMessagingProxy* proxy, int32_t exitCode, bool stoppedByParent)
+extern "C" void WebWorker__workerGlobalScopeDestroyed(WorkerMessagingProxy* proxy, int32_t exitCode, bool stoppedByParent, WorkerTerminationReason terminationReason)
 {
-    proxy->workerGlobalScopeDestroyed(exitCode, stoppedByParent);
+    proxy->workerGlobalScopeDestroyed(exitCode, stoppedByParent, terminationReason);
 }
 
 extern "C" void WebWorker__parentContextWillDestroy(WorkerMessagingProxy* proxy)
@@ -224,6 +224,28 @@ JSC_DECLARE_HOST_FUNCTION(jsFunctionSetNodeWorkerStdioPorts);
 
 // node:worker_threads internals that read a Worker's native state; private (handed to the module
 // through createNodeWorkerThreadsBinding), not properties of the web Worker.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionWorkerResourceLimits, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    double maxOldMegabytes = 0;
+    if (callFrame->argumentCount()) {
+        auto* worker = dynamicDowncast<JSWorker>(callFrame->argument(0));
+        if (worker && !worker->wrapped().hasExited())
+            maxOldMegabytes = worker->wrapped().contextProxy().options().maxOldGenerationSizeMb;
+    } else if (auto* proxy = WebWorker__getMessagingProxy(defaultGlobalObject(globalObject)->bunVM())) {
+        maxOldMegabytes = proxy->options().maxOldGenerationSizeMb;
+    }
+    auto* result = constructEmptyObject(globalObject);
+    RETURN_IF_EXCEPTION(scope, { });
+    // JSC has no Node default-size equivalents for unsupported resource fields.
+    // Report only a configured, represented cap, never invented V8 defaults.
+    if (maxOldMegabytes)
+        result->putDirect(vm, Identifier::fromString(vm, "maxOldGenerationSizeMb"_s), jsNumber(maxOldMegabytes));
+    RETURN_IF_EXCEPTION(scope, { });
+    return JSValue::encode(result);
+}
+
 JSC_DEFINE_HOST_FUNCTION(jsFunctionWorkerHasRef, (JSGlobalObject*, CallFrame* callFrame))
 {
     auto* worker = dynamicDowncast<JSWorker>(callFrame->argument(0));
@@ -381,7 +403,7 @@ JSValue createNodeWorkerThreadsBinding(Zig::GlobalObject* globalObject)
 
     bool isNodeWorker = proxy && proxy->options().kind == WorkerOptions::Kind::Node;
 
-    JSObject* array = constructEmptyArray(globalObject, nullptr, 19);
+    JSObject* array = constructEmptyArray(globalObject, nullptr, 20);
     RETURN_IF_EXCEPTION(scope, {});
     array->putDirectIndex(globalObject, 0, workerData);
     RETURN_IF_EXCEPTION(scope, {});
@@ -422,6 +444,8 @@ JSValue createNodeWorkerThreadsBinding(Zig::GlobalObject* globalObject)
     array->putDirectIndex(globalObject, 17, JSFunction::create(vm, globalObject, 1, "workerHasRef"_s, jsFunctionWorkerHasRef, ImplementationVisibility::Public, NoIntrinsic));
     RETURN_IF_EXCEPTION(scope, {});
     array->putDirectIndex(globalObject, 18, JSFunction::create(vm, globalObject, 1, "workerEventLoopUtilization"_s, jsFunctionWorkerEventLoopUtilization, ImplementationVisibility::Public, NoIntrinsic));
+    RETURN_IF_EXCEPTION(scope, { });
+    array->putDirectIndex(globalObject, 19, JSFunction::create(vm, globalObject, 1, "workerResourceLimits"_s, jsFunctionWorkerResourceLimits, ImplementationVisibility::Public, NoIntrinsic));
     RETURN_IF_EXCEPTION(scope, {});
     return array;
 }

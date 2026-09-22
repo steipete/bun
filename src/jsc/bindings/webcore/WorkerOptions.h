@@ -14,6 +14,11 @@ enum class WorkerEvalMode : uint8_t {
     Module,
 };
 
+enum class WorkerTerminationReason : uint8_t {
+    None = 0,
+    HeapLimit = 1,
+};
+
 struct WorkerOptions {
     enum class Kind : uint8_t {
         // Created by the global Worker constructor
@@ -24,6 +29,9 @@ struct WorkerOptions {
 
     String name;
     bool mini { false };
+    // Immutable per-worker old-generation cap; zero leaves the heap unlimited.
+    size_t maxOldGenerationSize { 0 };
+    double maxOldGenerationSizeMb { 0 };
     bool unref { false };
     // worker_threads `env: SHARE_ENV`: the environment tree resolved on the parent
     // thread, which this worker joins instead of receiving an env snapshot.

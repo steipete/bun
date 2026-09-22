@@ -79,6 +79,7 @@ const {
   16: WebWorker,
   17: _workerHasRef,
   18: _workerEventLoopUtilization,
+  19: _workerResourceLimits,
 } = $cpp("Worker.cpp", "createNodeWorkerThreadsBinding") as [
   unknown,
   number,
@@ -102,6 +103,7 @@ const {
   new (...args: [...ConstructorParameters<typeof globalThis.Worker>, nodeWorker: Worker]) => WebWorker,
   (worker: WebWorker) => boolean | undefined,
   (worker: WebWorker) => [number, number] | null,
+  (worker?: WebWorker) => { maxOldGenerationSizeMb?: number },
 ];
 
 type NodeWorkerOptions = import("node:worker_threads").WorkerOptions;
@@ -328,7 +330,7 @@ Object.defineProperty(MessagePort.prototype, kInspectCustom, {
   configurable: true,
 });
 
-let resourceLimits = {};
+const resourceLimits = _workerResourceLimits();
 
 const BUN_WORKER_STDIO_KEY = "@@bunWorkerThreadsStdio";
 const BUN_WORKER_MESSAGING_KEY = "@@bunWorkerThreadsMessaging";
@@ -1084,6 +1086,10 @@ class Worker extends EventEmitter {
 
   get stderr() {
     return this.#stderr ?? null;
+  }
+
+  get resourceLimits() {
+    return _workerResourceLimits(this.#worker);
   }
 
   get performance() {

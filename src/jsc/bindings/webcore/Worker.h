@@ -70,10 +70,10 @@ public:
     // thread. False once the thread has gone (node reports all-zero then).
     bool eventLoopUtilization(double& elapsedMs, double& idleMs);
 
-    // Node worker_threads: 'message'/'error'/'messageerror' are not delivered once terminate() was
-    // called; 'close' (which carries the exit code) always is.
+    // Node worker_threads: ordinary events stop after terminate(), while final native outcome
+    // events are still delivered when their cause won before a later terminate() request.
     void dispatchEvent(Event&) final;
-    void dispatchCloseEvent(Event&);
+    void dispatchFinalEvent(Event&);
 
     const String& name() const { return m_name; }
     // Both identifiers are process-unique; threadId is derived from the worker's.

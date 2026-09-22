@@ -3300,8 +3300,13 @@ extern "C" napi_status napi_type_tag_object(napi_env env, napi_value value, cons
 
     auto& vm = JSC::getVM(globalObject);
     auto* new_tag = Bun::NapiTypeTag::create(vm, globalObject->NapiTypeTagStructure(), *type_tag);
-    globalObject->napiTypeTags()->set(vm, js_object, new_tag);
-    NAPI_RETURN_SUCCESS(env);
+    auto* typeTags = globalObject->napiTypeTags();
+    typeTags->set(vm, js_object, new_tag);
+    JSC::EnsureStillAliveScope ensureTypeTagsIsAlive(typeTags);
+    JSC::EnsureStillAliveScope ensureObjectIsAlive(js_object);
+    JSC::EnsureStillAliveScope ensureTagIsAlive(new_tag);
+    vm.heap.serviceOldGenerationLimitIfPending();
+    NAPI_RETURN_SUCCESS_UNLESS_EXCEPTION(env);
 }
 
 extern "C" napi_status napi_check_object_type_tag(napi_env env, napi_value value, const napi_type_tag* type_tag, bool* result)

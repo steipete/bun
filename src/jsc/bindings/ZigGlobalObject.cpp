@@ -467,7 +467,10 @@ extern "C" bool Bun__hasStandaloneModuleGraph();
 extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, int32_t executionContextId, bool miniMode, bool evalMode, void* worker_ptr)
 {
     auto heapSize = miniMode ? JSC::HeapType::Small : JSC::HeapType::Large;
-    RefPtr<JSC::VM> vmPtr = JSC::VM::tryCreate(heapSize);
+    JSC::HeapConfiguration heapConfiguration;
+    if (auto* worker = static_cast<WebCore::WorkerMessagingProxy*>(worker_ptr))
+        heapConfiguration.maxOldGenerationSize = worker->options().maxOldGenerationSize;
+    RefPtr<JSC::VM> vmPtr = JSC::VM::tryCreate(heapSize, nullptr, heapConfiguration);
     if (!vmPtr) [[unlikely]] {
         BUN_PANIC("Failed to allocate JavaScriptCore Virtual Machine. Did your computer run out of memory? Or maybe you compiled Bun with a mismatching libc++ version or compiler?");
     }

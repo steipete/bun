@@ -1587,7 +1587,13 @@ JSC_DEFINE_HOST_FUNCTION(vmModule_createContext, (JSGlobalObject * globalObject,
     targetContext->setContextifiedObject(sandbox);
 
     // Store context in WeakMap for isContext checks
-    zigGlobalObject->vmModuleContextMap()->set(vm, sandbox, targetContext);
+    auto* contextMap = zigGlobalObject->vmModuleContextMap();
+    contextMap->set(vm, sandbox, targetContext);
+    JSC::EnsureStillAliveScope ensureContextMapIsAlive(contextMap);
+    JSC::EnsureStillAliveScope ensureSandboxIsAlive(sandbox);
+    JSC::EnsureStillAliveScope ensureTargetContextIsAlive(targetContext);
+    vm.heap.serviceOldGenerationLimitIfPending();
+    RETURN_IF_EXCEPTION(scope, {});
 
     if (notContextified) {
         auto* specialSandbox = NodeVMSpecialSandbox::create(vm, targetContext);

@@ -31,6 +31,34 @@
 #include "NativePromiseContext.h"
 #include "StrongRootBlock.h"
 
+extern "C" bool WebWorker__requestHeapLimitTermination(const void* worker);
+
+namespace Bun {
+class WorkerHeapLimitObserver final : public JSC::HeapObserver {
+public:
+    WorkerHeapLimitObserver(JSC::Heap& heap, const void* worker)
+        : m_heap(heap)
+        , m_worker(worker)
+    {
+        m_heap.addObserver(this);
+    }
+    ~WorkerHeapLimitObserver() final { m_heap.removeObserver(this); }
+
+private:
+    void willGarbageCollect() final { }
+    void didGarbageCollect(JSC::CollectionScope scope) final
+    {
+        // This callback runs with the mutator stopped. It requests the existing
+        // worker-local stop; it cannot allocate, run JS, or raise process OOM.
+        if (scope == JSC::CollectionScope::Full
+            && m_heap.chargedOldBytesAfterLastFullCollection() > m_heap.maxOldGenerationSize())
+            WebWorker__requestHeapLimitTermination(m_worker);
+    }
+    JSC::Heap& m_heap;
+    const void* m_worker;
+};
+}
+
 namespace WebCore {
 using namespace JSC;
 
@@ -96,8 +124,34 @@ void JSVMClientData::JSHeapDataDeleter::operator()(JSHeapData* heapData) const
         delete heapData;
 }
 
+void JSVMClientData::startWorkerHeapLimit(VM& vm, const void* worker)
+{
+    if (!vm.heap.maxOldGenerationSize())
+        return;
+    ASSERT(!m_workerHeapLimitObserver);
+    m_workerHeapLimitObserver = makeUnique<Bun::WorkerHeapLimitObserver>(vm.heap, worker);
+    vm.heap.serviceOldGenerationLimitBeforeEntry();
+}
+
+void JSVMClientData::stopWorkerHeapLimit()
+{
+    m_workerHeapLimitObserver = nullptr;
+}
+
+extern "C" void WebWorker__startHeapLimit(JSGlobalObject* globalObject, const void* worker)
+{
+    auto& vm = globalObject->vm();
+    static_cast<JSVMClientData*>(vm.clientData)->startWorkerHeapLimit(vm, worker);
+}
+
+extern "C" void WebWorker__stopHeapLimit(JSGlobalObject* globalObject)
+{
+    static_cast<JSVMClientData*>(globalObject->vm().clientData)->stopWorkerHeapLimit();
+}
+
 JSVMClientData::~JSVMClientData()
 {
+    ASSERT(!m_workerHeapLimitObserver);
     while (!m_clients.isEmpty()) {
         auto* client = &*m_clients.begin();
         client->remove();

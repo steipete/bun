@@ -20,6 +20,9 @@
 
 #include "config.h"
 #include "JSWorker.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "ActiveDOMObject.h"
 #include "BunCPUProfiler.h"
@@ -59,6 +62,7 @@
 #include "WebCoreJSClientData.h"
 #include <JavaScriptCore/HeapAnalyzer.h>
 #include <JavaScriptCore/IteratorOperations.h>
+#include <JavaScriptCore/Options.h>
 #include <JavaScriptCore/JSArray.h>
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObjectHeapCellType.h>
@@ -316,6 +320,36 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
     Vector<JSC::Strong<JSC::JSObject>> transferList;
 
     if (JSObject* optionsObject = dynamicDowncast<JSC::JSObject>(argument1.value())) {
+        if (options.kind == WorkerOptions::Kind::Node) {
+            auto limits = optionsObject->get(lexicalGlobalObject, Identifier::fromString(vm, "resourceLimits"_s));
+            RETURN_IF_EXCEPTION(throwScope, { });
+            // Match Node's object-only option and numeric max-old admission. Other
+            // resource-limit fields retain their existing unsupported behavior.
+            if (limits.isObject() && !limits.isCallable()) {
+                auto key = Identifier::fromString(vm, "maxOldGenerationSizeMb"_s);
+                auto value = limits.getObject()->get(lexicalGlobalObject, key);
+                RETURN_IF_EXCEPTION(throwScope, { });
+                if (value.isNumber()) {
+                    // Node reads the property again for Math.max(value, 2).
+                    value = limits.getObject()->get(lexicalGlobalObject, key);
+                    RETURN_IF_EXCEPTION(throwScope, { });
+                    double megabytes = value.toNumber(lexicalGlobalObject);
+                    RETURN_IF_EXCEPTION(throwScope, { });
+                    if (!std::isnan(megabytes)) {
+                        megabytes = std::max(megabytes, 2.0);
+                        double bytes = megabytes * (1024.0 * 1024.0);
+                        // Never convert infinity or an out-of-range double to size_t.
+                        // Node's native cast has no portable result for these inputs.
+                        if (!std::isfinite(bytes) || bytes >= static_cast<double>(std::numeric_limits<size_t>::max())) {
+                            throwScope.throwException(lexicalGlobalObject, Bun::createError(globalObject, Bun::ErrorCode::ERR_OUT_OF_RANGE, "options.resourceLimits.maxOldGenerationSizeMb must fit in a finite native byte count"_s));
+                            return { };
+                        }
+                        options.maxOldGenerationSize = static_cast<size_t>(bytes);
+                        options.maxOldGenerationSizeMb = megabytes;
+                    }
+                }
+            }
+        }
         auto nameValue = optionsObject->getIfPropertyExists(lexicalGlobalObject, vm.propertyNames->name);
         RETURN_IF_EXCEPTION(throwScope, {});
         if (nameValue) {
@@ -495,6 +529,11 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
                 }
             }
         }
+    }
+
+    if (options.maxOldGenerationSize && !JSC::Options::useGC()) {
+        throwScope.throwException(lexicalGlobalObject, Bun::createError(globalObject, Bun::ErrorCode::ERR_WORKER_UNSUPPORTED_OPERATION, "options.resourceLimits.maxOldGenerationSizeMb is unavailable when garbage collection is disabled"_s));
+        return { };
     }
 
     // Resolve the spawning thread's env tree (founding one if needed) so disjoint

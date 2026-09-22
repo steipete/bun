@@ -35,7 +35,7 @@
 use core::panic::Location;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bun_threading::{Condvar, Guarded};
 
@@ -100,8 +100,16 @@ struct ReadMostly {
     vm: *mut VirtualMachine,
 }
 
+struct WorkerTerminationTargets {
+    jsc_vm: NonNull<crate::VM>,
+    native_loop: NonNull<bun_uws::Loop>,
+}
+
 pub struct Shared {
     hot: ReadMostly,
+    // Bound once before publishing a worker's handle. Both foreign targets
+    // outlive the active/Closed gate; requesting a stop never borrows the VM.
+    worker_termination_targets: OnceLock<WorkerTerminationTargets>,
     /// Outstanding [`Ticket`]s. Teardown waits for zero.
     tickets: AtomicU32,
     /// Threads currently inside a weak `post`/keep-alive/wake. `Closed` is
@@ -134,7 +142,9 @@ struct LiveTickets {
 
 // SAFETY: `vm` is dereferenced only under the discipline in the module doc
 // (ticket held ⇒ VM alive; weak ⇒ inside the `active` gate before `Closed`);
-// everything else is atomics / sync primitives.
+// The immutable worker targets are used only under the same gate, through
+// thread-safe opaque JSC and raw uSockets operations; remaining fields are
+// atomics / sync primitives.
 unsafe impl Send for Shared {}
 // SAFETY: as above.
 unsafe impl Sync for Shared {}
@@ -310,6 +320,7 @@ impl VmHandle {
                 state: AtomicU8::new(State::Open as u8),
                 vm,
             },
+            worker_termination_targets: OnceLock::new(),
             tickets: AtomicU32::new(0),
             active: AtomicU32::new(0),
             drained: (Guarded::new(()), Condvar::new()),
@@ -320,6 +331,27 @@ impl VmHandle {
                 gate: core::sync::atomic::AtomicBool::new(false),
             },
         }))
+    }
+
+    /// # Safety
+    /// Bind on the worker thread before publishing its handle. Both pointers
+    /// must remain live until this handle's close_and_wait has completed.
+    pub(crate) unsafe fn bind_worker_termination_targets(
+        &self,
+        jsc_vm: NonNull<crate::VM>,
+        native_loop: NonNull<bun_uws::Loop>,
+    ) {
+        self.assert_js_thread();
+        assert!(
+            self.0
+                .worker_termination_targets
+                .set(WorkerTerminationTargets {
+                    jsc_vm,
+                    native_loop
+                })
+                .is_ok(),
+            "worker termination targets must be bound once"
+        );
     }
 
     #[inline]
@@ -387,15 +419,22 @@ impl VmHandle {
 
     /// [`stop`](Self::stop), raise a JSC `TerminationException` in the VM at
     /// its next safepoint, and wake its loop. Any thread (a parent's
-    /// `worker.terminate()`); no-op once the VM is closed.
+    /// `worker.terminate()`); no-op once the VM is closed. Worker startup must
+    /// bind the native targets before exposing a handle to any stop requester.
     pub fn request_termination(&self) {
         self.stop();
         if let Some(_a) = self.enter() {
-            // SAFETY: inside the gate before `Closed` ⇒ the VM is alive;
-            // `notify_need_termination` is thread-safe (VMTraps). Raw field
-            // read, no `&VirtualMachine` formed off-thread.
-            unsafe { (*(*self.0.hot.vm).jsc_vm.cast_const()).notify_need_termination() };
-            self.0.loop_of(LoopKind::Regular).wakeup();
+            let targets = self
+                .0
+                .worker_termination_targets
+                .get()
+                .expect("worker termination targets must be bound before publication");
+            // SAFETY: the active gate outlives both thread-safe native calls;
+            // neither call borrows the Rust VM or either embedded event loop.
+            unsafe {
+                crate::VM::opaque_ref(targets.jsc_vm.as_ptr()).notify_need_termination();
+                bun_uws::us_wakeup_loop(targets.native_loop.as_ptr());
+            }
         }
     }
 

@@ -133,6 +133,8 @@ pub struct WebWorker {
     /// the worker itself (`process.exit()`); polled by the worker loop between
     /// ticks and turned into a JSC TerminationException for running script.
     requested_terminate: AtomicBool,
+    /// A heap-limit request won the requested-terminate gate while the VM handle was live.
+    heap_limit_claimed: AtomicBool,
     /// The worker VM's uncounted handle: how the parent (or an exiting
     /// ancestor) asks it to terminate. `None` before `start_vm()` publishes it
     /// and after `shutdown()` unpublishes it.
@@ -201,6 +203,13 @@ enum EntryOutcome {
 }
 
 #[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum WorkerTerminationReason {
+    None = 0,
+    HeapLimit = 1,
+}
+
+#[repr(u8)]
 #[derive(Copy, Clone, Eq, PartialEq, strum::IntoStaticStr)]
 pub enum Status {
     /// Thread not yet started / startVM in progress.
@@ -223,9 +232,12 @@ unsafe extern "C" {
         proxy: *mut c_void,
         exit_code: i32,
         stopped_by_parent: bool,
+        termination_reason: WorkerTerminationReason,
     );
     safe fn WebWorker__parentContextWillDestroy(proxy: *mut c_void);
     safe fn WebWorker__entrySettled(global: &JSGlobalObject);
+    safe fn WebWorker__startHeapLimit(global: &JSGlobalObject, worker: *const c_void);
+    safe fn WebWorker__stopHeapLimit(global: &JSGlobalObject);
     /// Loads `node:worker_threads` in this VM (it rebinds process stdio and
     /// registers parentPort). May leave an exception pending.
     safe fn Bun__Worker__loadNodeWorkerThreadsModule(global: &JSGlobalObject);
@@ -589,6 +601,7 @@ impl WebWorker {
             parent_cpu_profiler_config: unsafe { (*parent).cpu_profiler_config.clone() },
             ref_count: bun_ptr::ThreadSafeRefCount::init(),
             requested_terminate: AtomicBool::new(false),
+            heap_limit_claimed: AtomicBool::new(false),
             vm_handle: bun_threading::Guarded::new(None),
             elu: bun_threading::Guarded::new(None),
             vm: Cell::new(core::ptr::null_mut()),
@@ -733,6 +746,28 @@ impl WebWorker {
             // safepoint and its loop woken.
             handle.request_termination();
         }
+    }
+
+    /// Request a resource-limit stop from a HeapObserver callback. Any thread.
+    ///
+    /// The observer owns the pointer lifetime: it registers after vm_handle
+    /// publication and unregisters before shutdown takes that handle.
+    #[unsafe(export_name = "WebWorker__requestHeapLimitTermination")]
+    pub(crate) extern "C" fn request_heap_limit_termination(this: &WebWorker) -> bool {
+        let handle = this.vm_handle.lock();
+        let Some(handle) = &*handle else {
+            return false;
+        };
+        if this.set_requested_terminate() {
+            // A reentrant process.exit() may already own the outcome without
+            // arming a trap during on_exit. Enforce the cap without replacing
+            // that first request's cause or claiming a heap-limit error.
+            handle.request_termination();
+            return false;
+        }
+        this.heap_limit_claimed.store(true, Ordering::Release);
+        handle.request_termination();
+        true
     }
 
     /// The parent reading this worker's loop counters for `eventLoopUtilization()`: false outside
@@ -968,9 +1003,23 @@ impl WebWorker {
         // non-null vm runs vm.onExit() (JS), which requires holdAPILock.
         // Instead we return; threadMain enters holdAPILock(spin) and spin()'s
         // first check observes requested_terminate.
+        // Initialization has created both foreign targets. Bind after the
+        // preparation borrow ends and before any worker stop can use the handle.
+        // SAFETY: init_worker returned this thread's fully initialized VM.
+        let handle = unsafe { (*vm).handle() };
+        // SAFETY: teardown closes/waits on this handle before destroying the
+        // JSC VM or the regular loop's native uSockets loop.
+        unsafe {
+            handle.bind_worker_termination_targets(
+                NonNull::new((*vm).jsc_vm).expect("worker JSC VM initialized"),
+                (*vm)
+                    .regular_event_loop
+                    .uws_loop
+                    .expect("worker loop initialized"),
+            );
+        }
         self.vm.set(vm);
-        // SAFETY: `vm` is the live VM just built on this thread.
-        *self.vm_handle.lock() = Some(unsafe { (*vm).handle() });
+        *self.vm_handle.lock() = Some(handle);
 
         // SAFETY: `vm` is a valid heap-allocated VM ptr (checked above).
         unsafe {
@@ -1028,9 +1077,10 @@ impl WebWorker {
         debug_assert!(self.status.get() == Status::Start);
         self.set_status(Status::Starting);
 
-        // Terminated during startVM() (or startVM() short-circuited here on
-        // configureDefines failure) — shut down under the API lock so the
-        // JSC::VM built by initWorker is torn down rather than leaked.
+        // The handle is published and this thread holds the API lock. Register
+        // before either startup or early-error cleanup can enter JS. A request
+        // already owned by setup failure or the parent keeps its original cause.
+        WebWorker__startHeapLimit(vm.global(), core::ptr::from_ref(self).cast());
         if self.has_requested_terminate() {
             self.flush_logs(vm);
             return self.shutdown();
@@ -1271,18 +1321,18 @@ impl WebWorker {
         let mut arena = self.arena.replace(None);
         let env_loader = self.worker_env_loader.replace(core::ptr::null_mut());
 
-        // ---- 1. Unpublish vm ------------------------------------------------
-        drop(self.vm_handle.lock().take());
-        // A parent mid-read holds this lock, so the loop it is reading outlives the read; the
-        // teardown below is what destroys the loop.
+        // ---- 1. Retire JS-facing access, retain termination custody ---------
+        // A parent mid-read holds this lock, so its loop-counter borrow ends now.
         *self.elu.lock() = None;
+        // Keep the existing reentrant process.exit() rule: it cannot redispatch
+        // exit or arm a new trap through self.vm while exit callbacks run.
         let vm_ptr = self.vm.replace(core::ptr::null_mut());
 
-        // ---- 2. User exit handlers -----------------------------------------
+        // ---- 2. User exit handlers and their flush/NAPI cleanup --------------
         let mut exit_code: i32 = 0;
         if !vm_ptr.is_null() {
-            // SAFETY: vm_ptr valid; no other thread holds a pointer to it (they
-            // only ever held its handle) — `&mut` is exclusive.
+            // SAFETY: vm_ptr is this thread's live VM under its API lock.
+            // Published termination requests touch only cached foreign targets.
             let vm = unsafe { &mut *vm_ptr };
             vm.is_shutting_down = true;
             vm.on_exit();
@@ -1291,7 +1341,15 @@ impl WebWorker {
                 "[{}] shutdown: exit handlers done",
                 self.execution_context_id
             );
+            WebWorker__stopHeapLimit(vm.global());
+        }
+        // No permitted JS remains. Unregister first, then withdraw the handle
+        // and capture the outcome, including a limit reached during exit work.
+        let handle = self.vm_handle.lock().take();
+        let termination_reason = self.termination_reason();
+        drop(handle);
 
+        if !vm_ptr.is_null() {
             // ---- 3–5. Stop, forbid script, wait, ~VM, loops, destroy ----------
             // SAFETY: this thread's VM; sole owner.
             unsafe { VirtualMachine::teardown(vm_ptr, crate::virtual_machine::Teardown::Worker) };
@@ -1348,6 +1406,7 @@ impl WebWorker {
             self.messaging_proxy,
             exit_code,
             self.stopped_by_parent(),
+            termination_reason,
         );
     }
 
@@ -1357,6 +1416,16 @@ impl WebWorker {
     pub fn stopped_by_parent(&self) -> bool {
         self.terminated_by_parent.load(Ordering::Relaxed)
             && !self.exit_called.load(Ordering::Relaxed)
+    }
+
+    fn termination_reason(&self) -> WorkerTerminationReason {
+        if self.heap_limit_claimed.load(Ordering::Acquire)
+            && !self.exit_called.load(Ordering::Acquire)
+        {
+            WorkerTerminationReason::HeapLimit
+        } else {
+            WorkerTerminationReason::None
+        }
     }
 
     /// process.exit() inside the worker. Worker-thread only.

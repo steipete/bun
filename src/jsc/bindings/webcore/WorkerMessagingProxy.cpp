@@ -733,13 +733,13 @@ void WorkerMessagingProxy::postErrorToWorkerObject(Zig::GlobalObject& workerGlob
     }
 }
 
-void WorkerMessagingProxy::workerGlobalScopeDestroyed(int32_t exitCode, bool stoppedByParent)
+void WorkerMessagingProxy::workerGlobalScopeDestroyed(int32_t exitCode, bool stoppedByParent, WorkerTerminationReason terminationReason)
 {
     // Last thing the worker thread does with this object. If the parent context is gone the task is
     // dropped and the proxy (with the thread's ref on it) leaks; the parent's own exit path
     // (parentContextWillDestroy) is what normally prevents that.
-    ScriptExecutionContext::postTaskTo(m_loaderContextIdentifier, m_loaderLoopKind, [protectedThis = Ref { *this }, exitCode, stoppedByParent](ScriptExecutionContext&) {
-        protectedThis->workerGlobalScopeDestroyedInternal(exitCode, stoppedByParent);
+    ScriptExecutionContext::postTaskTo(m_loaderContextIdentifier, m_loaderLoopKind, [protectedThis = Ref { *this }, exitCode, stoppedByParent, terminationReason](ScriptExecutionContext&) {
+        protectedThis->workerGlobalScopeDestroyedInternal(exitCode, stoppedByParent, terminationReason);
     });
 }
 
@@ -775,16 +775,17 @@ void WorkerMessagingProxy::dropUndeliveredWorkerMessages()
     // orphaned endpoints and notify each entangled peer.
 }
 
-void WorkerMessagingProxy::workerGlobalScopeDestroyedInternal(int32_t exitCode, bool stoppedByParent)
+void WorkerMessagingProxy::workerGlobalScopeDestroyedInternal(int32_t exitCode, bool stoppedByParent, WorkerTerminationReason terminationReason)
 {
     ASSERT(m_scriptExecutionContext && m_scriptExecutionContext->isContextThread());
     Ref protectedThis { *this };
 
-    // node:worker_threads: a worker stopped by its parent once it was running reports 1 unless it
-    // called process.exit() itself (a process.exitCode it merely set is not used, as in Node). The
-    // Web Worker's 'close' event keeps 0 for that case (documented).
-    if (m_options.kind == WorkerOptions::Kind::Node && stoppedByParent)
-        exitCode = 1;
+    if (m_options.kind == WorkerOptions::Kind::Node) {
+        if (terminationReason == WorkerTerminationReason::HeapLimit)
+            exitCode = 1;
+        else if (stoppedByParent)
+            exitCode = 1;
+    }
 
     // Closing while 'close' dispatches so handlers observe threadId == -1 / !isOnline() but a
     // postMessage() from inside them is still accepted and dropped (browser/Node behaviour).
@@ -801,9 +802,20 @@ void WorkerMessagingProxy::workerGlobalScopeDestroyedInternal(int32_t exitCode, 
     // task then finds it empty.
     drainMessagesToWorkerObject(*m_scriptExecutionContext, DrainBudget::UntilEmpty);
 
-    if (RefPtr workerObject = m_workerObject; workerObject && workerObject->hasEventListeners(eventNames().closeEvent)) {
+    RefPtr workerObject = m_workerObject;
+    if (workerObject && m_options.kind == WorkerOptions::Kind::Node && terminationReason == WorkerTerminationReason::HeapLimit) {
+        auto* globalObject = defaultGlobalObject(m_scriptExecutionContext->globalObject());
+        if (auto* error = Bun::createError(globalObject, Bun::ErrorCode::ERR_WORKER_OUT_OF_MEMORY, "Worker terminated due to reaching memory limit: JS heap out of memory"_s)) {
+            ErrorEvent::Init init;
+            init.error = error;
+            auto event = ErrorEvent::create(eventNames().errorEvent, init, EventIsTrusted::Yes);
+            workerObject->dispatchFinalEvent(event);
+        }
+    }
+
+    if (workerObject && workerObject->hasEventListeners(eventNames().closeEvent)) {
         auto event = CloseEvent::create(exitCode == 0, static_cast<unsigned short>(exitCode), exitCode == 0 ? "Worker terminated normally"_s : "Worker exited abnormally"_s);
-        workerObject->dispatchCloseEvent(event);
+        workerObject->dispatchFinalEvent(event);
     }
 
     releaseWorkerThread();

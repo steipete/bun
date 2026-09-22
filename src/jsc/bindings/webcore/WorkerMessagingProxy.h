@@ -110,7 +110,7 @@ public:
     void postErrorToWorkerObject(Zig::GlobalObject&, const String& message, JSC::JSValue error);
     // The thread's global scope, VM and per-thread state are gone; only the OS thread remains.
     // stoppedByParent: it stopped because it was asked to and never called process.exit() itself.
-    void workerGlobalScopeDestroyed(int32_t exitCode, bool stoppedByParent);
+    void workerGlobalScopeDestroyed(int32_t exitCode, bool stoppedByParent, WorkerTerminationReason);
     void drainMessagesToWorkerGlobalScope(ScriptExecutionContext&);
 
     // -- Either thread ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ public:
 private:
     WorkerMessagingProxy(Worker&, ScriptExecutionContext& parentContext, WorkerOptions&&);
 
-    void workerGlobalScopeDestroyedInternal(int32_t exitCode, bool stoppedByParent);
+    void workerGlobalScopeDestroyedInternal(int32_t exitCode, bool stoppedByParent, WorkerTerminationReason);
     void releaseWorkerThread();
     void dropUndeliveredWorkerMessages();
     void drainMessagesToWorkerObject(ScriptExecutionContext&, DrainBudget);
