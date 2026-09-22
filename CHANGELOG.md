@@ -6,6 +6,7 @@ This changelog records changes maintained in this fork.
 
 ### Fixed
 
+- Node workers support `resourceLimits.maxOldGenerationSizeMb`, with retained old-generation accounting and safe weak-container debt servicing.
 - HTTP server request aborts follow socket-close ordering so SSE response cleanup does not leave an unhandled `ECONNRESET` error.
 - HTTP server sockets apply receive backpressure to raw `CONNECT` and upgrade streams.
 - HTTP server sockets preserve ordinary `pause()` behavior while receive backpressure follows readable capacity.
