@@ -22,6 +22,7 @@
 #include "BunGCOutputConstraint.h"
 #include "WebCoreTypedArrayController.h"
 #include <JavaScriptCore/JSCInlines.h>
+#include <wtf/TZoneMallocInlines.h>
 
 #include "JSDOMWrapper.h"
 #include <JavaScriptCore/DeferredWorkTimer.h>
@@ -35,6 +36,8 @@ extern "C" bool WebWorker__requestHeapLimitTermination(const void* worker);
 
 namespace Bun {
 class WorkerHeapLimitObserver final : public JSC::HeapObserver {
+    WTF_MAKE_TZONE_ALLOCATED(WorkerHeapLimitObserver);
+
 public:
     WorkerHeapLimitObserver(JSC::Heap& heap, const void* worker)
         : m_heap(heap)
@@ -57,6 +60,8 @@ private:
     JSC::Heap& m_heap;
     const void* m_worker;
 };
+
+WTF_MAKE_TZONE_ALLOCATED_IMPL(WorkerHeapLimitObserver);
 }
 
 namespace WebCore {
