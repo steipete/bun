@@ -5,11 +5,12 @@
 // Protocol WebSocket server with breakpoint pausing.
 const { hideFromStack } = require("internal/shared");
 const { validateString, validateFunction } = require("internal/validators");
-const { SafeSet } = require("internal/primordials");
+const { SafeSet, SafeMap } = require("internal/primordials");
 const EventEmitter = require("node:events");
 const { pathToFileURL } = require("node:url");
 const { isAbsolute } = require("node:path");
 const DateNow = Date.now;
+const heapRequests = $cpp("NodeInspectorHeap.cpp", "Bun::createNodeInspectorHeapBinding");
 
 // #handleMethod return marker for inspector-protocol errors: the callback
 // receives the plain `{ code, message }` object (Node delivers protocol
@@ -417,6 +418,9 @@ function collectCoverageScripts(): any[] | Error {
 
 class Session extends EventEmitter {
   #connected = false;
+  #heapTargetIsMainThread = false;
+  #connectionEpoch = {};
+  #heapRequests: Map<number, { epoch: object; callback?: (error: Error | null, result?: object) => void }> = new SafeMap();
   #profilerEnabled = false;
   #preciseCoverageEnabled = false;
   #preciseCoverageCallCount = false;
@@ -450,6 +454,8 @@ class Session extends EventEmitter {
       throw $ERR_INSPECTOR_ALREADY_CONNECTED();
     }
     this.#connected = true;
+    this.#heapTargetIsMainThread = false;
+    this.#connectionEpoch = {};
   }
 
   connectToMainThread() {
@@ -457,10 +463,20 @@ class Session extends EventEmitter {
       throw $ERR_INSPECTOR_NOT_WORKER();
     }
     this.connect();
+    this.#heapTargetIsMainThread = true;
   }
 
   disconnect() {
     if (!this.#connected) return;
+    const pendingHeapRequests = this.#heapRequests;
+    this.#heapRequests = new SafeMap();
+    this.#connectionEpoch = {};
+    for (const [id, pending] of pendingHeapRequests) {
+      heapRequests.cancel(id);
+      if (pending.callback) {
+        process.nextTick(pending.callback, $ERR_INSPECTOR_CLOSED());
+      }
+    }
     if (isCPUProfilerRunning()) stopCPUProfiler();
     if (this.#preciseCoverageEnabled) {
       stopPreciseCoverage();
@@ -505,6 +521,20 @@ class Session extends EventEmitter {
       throw error;
     }
 
+    if (method === "HeapProfiler.collectGarbage") {
+      const epoch = this.#connectionEpoch;
+      const request = heapRequests.request(this.#heapTargetIsMainThread);
+      this.#heapRequests.set(request.id, { epoch, callback });
+      const complete = (error: Error | null, result?: object) => {
+        const pending = this.#heapRequests.get(request.id);
+        if (!pending || pending.epoch !== epoch) return;
+        this.#heapRequests.delete(request.id);
+        if (pending.callback) this.#deliverHeapResult(pending.callback, error, result);
+      };
+      request.promise.then((result: object) => complete(null, result), (error: Error) => complete(error));
+      return;
+    }
+
     const result = this.#handleMethod(method, params as object | undefined);
 
     if (callback) {
@@ -530,6 +560,20 @@ class Session extends EventEmitter {
         throw error;
       }
       return result;
+    }
+  }
+
+  #deliverHeapResult(callback: (error: Error | null, result?: object) => void, error: Error | null, result?: object) {
+    try {
+      callback(error, result);
+    } catch (error) {
+      let warning: Error;
+      try {
+        warning = error instanceof Error ? error : new Error(String(error));
+      } catch {
+        warning = new Error("Inspector callback threw an unprintable value");
+      }
+      process.emitWarning(warning);
     }
   }
 

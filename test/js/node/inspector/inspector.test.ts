@@ -1085,3 +1085,137 @@ test("disconnect does not clobber a console method reassigned by user code", () 
     console.log = before;
   }
 });
+
+
+test("Session HeapProfiler.collectGarbage completes asynchronously without opening a server", async () => {
+  const session = new inspector.Session();
+  session.connect();
+  try {
+    let posting = true;
+    const completed = new Promise<void>((resolve, reject) => {
+      session.post("HeapProfiler.collectGarbage", (error, result) => {
+        try {
+          expect(posting).toBe(false);
+          expect(error).toBeNull();
+          expect(result).toEqual({});
+          expect(inspector.url()).toBeUndefined();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    posting = false;
+    await completed;
+  } finally {
+    session.disconnect();
+  }
+});
+
+test("Session disconnect cancels a pending heap request without affecting its replacement connection", async () => {
+  const session = new inspector.Session();
+  session.connect();
+  const results: string[] = [];
+  const cancelled = new Promise<void>((resolve, reject) => {
+    session.post("HeapProfiler.collectGarbage", (error) => {
+      try {
+        expect(error).toMatchObject({ code: "ERR_INSPECTOR_CLOSED" });
+        results.push("cancelled");
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+  session.disconnect();
+  session.connect();
+  try {
+    const replacement = new Promise<void>((resolve, reject) => {
+      session.post("HeapProfiler.collectGarbage", (error, result) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        try {
+          expect(result).toEqual({});
+          results.push("replacement");
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    await Promise.all([cancelled, replacement]);
+    expect(results.toSorted()).toEqual(["cancelled", "replacement"]);
+  } finally {
+    session.disconnect();
+  }
+});
+
+
+test("Session heap collection releases unowned targets and preserves strong owners", async () => {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", `
+      import { Session } from "node:inspector/promises";
+      import { setImmediate } from "node:timers";
+      const session = new Session();
+      session.connect();
+      try {
+        const held = { marker: "held" };
+        const heldRef = new WeakRef(held);
+        const releasedRef = new WeakRef({ marker: "released" });
+        const existed = releasedRef.deref() !== undefined;
+        // WeakRef keeps new targets alive until the creating job has finished.
+        await new Promise(resolve => setImmediate(resolve));
+        await session.post("HeapProfiler.collectGarbage");
+        console.log(JSON.stringify({
+          existed,
+          released: releasedRef.deref() === undefined,
+          held: heldRef.deref() === held,
+        }));
+      } finally {
+        session.disconnect();
+      }
+    `],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, stderr, exitCode }).toEqual({
+    stdout: '{"existed":true,"released":true,"held":true}\n',
+    stderr: "",
+    exitCode: 0,
+  });
+});
+
+
+const throwingHeapCallbackFixture = `
+import { Session } from "node:inspector";
+const session = new Session();
+session.connect();
+process.on("warning", error => console.log(JSON.stringify({ event: "warning", message: error.message })));
+process.on("uncaughtException", error => console.log(JSON.stringify({ event: "uncaughtException", message: error.message })));
+session.post("HeapProfiler.collectGarbage", () => {
+  session.disconnect();
+  throw new Error("heap callback failure");
+});
+if (process.argv[1] === "disconnected") session.disconnect();
+`;
+
+test.each([
+  ["completed", "warning"],
+  ["disconnected", "uncaughtException"],
+])("Session reports a throwing %s heap callback through %s", async (mode, event) => {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", throwingHeapCallbackFixture, mode],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, exitCode }).toEqual({
+    stdout: JSON.stringify({ event, message: "heap callback failure" }) + "\n",
+    exitCode: 0,
+  });
+});

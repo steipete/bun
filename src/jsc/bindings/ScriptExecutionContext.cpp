@@ -1,6 +1,7 @@
 #include "root.h"
 #include "headers.h"
 #include "ScriptExecutionContext.h"
+#include "NodeInspectorHeap.h"
 #include "ActiveDOMObject.h"
 #include "ContextDestructionObserver.h"
 
@@ -214,11 +215,21 @@ bool ScriptExecutionContext::isJSExecutionForbidden()
     return !m_vm || WebCore::clientData(*m_vm)->isStoppingOrStopped(*m_vm);
 }
 
+Bun::NodeInspectorHeapRequests& ScriptExecutionContext::nodeInspectorHeapRequests()
+{
+    ASSERT(isContextThread());
+    if (!m_nodeInspectorHeapRequests)
+        m_nodeInspectorHeapRequests = std::make_unique<Bun::NodeInspectorHeapRequests>(*this);
+    return *m_nodeInspectorHeapRequests;
+}
+
 void ScriptExecutionContext::prepareForDestruction()
 {
     ASSERT(isContextThread());
     ASSERT(m_globalObject);
 
+    if (m_nodeInspectorHeapRequests)
+        m_nodeInspectorHeapRequests->stop();
     stopActiveDOMObjects();
 
     // Event listeners would keep DOMWrapperWorld objects alive for too long. Also, they have references to JS objects,
@@ -238,6 +249,8 @@ void ScriptExecutionContext::removeAllEventListeners()
 void ScriptExecutionContext::globalObjectDestroyed()
 {
     ASSERT(isContextThread());
+    if (m_nodeInspectorHeapRequests)
+        m_nodeInspectorHeapRequests->stop();
     // A global collected on a live VM (ShadowRealm, a retired `bun test --isolate` global) never
     // went through prepareForDestruction(); its context-owned targets still hold listeners and the
     // Performance <-> PerformanceObserver cycle.

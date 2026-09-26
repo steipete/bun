@@ -82,7 +82,18 @@ function systemLibs(cfg: Config): string[] {
     // Assumes system ICU is in default lib paths — true on most distros.
     // Android: no system ICU; the local WebKit build must bundle it.
     if (cfg.webkit === "local" && cfg.abi !== "android") {
+      const staticIcu =
+        cfg.buildType === "Release" &&
+        !cfg.asan &&
+        !cfg.lto &&
+        cfg.abi === "gnu" &&
+        cfg.host.os === "linux" &&
+        cfg.host.arch === cfg.arch &&
+        cfg.crossTarget === undefined;
+      // Native release binaries must not depend on a distribution's ICU SONAME.
+      if (staticIcu) libs.push("-Wl,--push-state,-Bstatic,--start-group");
       libs.push("-licudata", "-licui18n", "-licuuc");
+      if (staticIcu) libs.push("-Wl,--end-group,--pop-state");
     }
   }
 

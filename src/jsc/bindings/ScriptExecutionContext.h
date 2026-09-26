@@ -29,6 +29,10 @@ namespace Zig {
 class GlobalObject;
 }
 
+namespace Bun {
+class NodeInspectorHeapRequests;
+}
+
 namespace WebCore {
 
 class WebSocket;
@@ -94,6 +98,8 @@ public:
     // run, where every ActiveDOMObject is stopped and every listener on context-owned targets is
     // removed. Runs before VM teardown, and when a live VM retires this context's global.
     void prepareForDestruction();
+    Bun::NodeInspectorHeapRequests& nodeInspectorHeapRequests();
+    Bun::NodeInspectorHeapRequests* existingNodeInspectorHeapRequests() { return m_nodeInspectorHeapRequests.get(); }
     void removeAllEventListeners();
     // The owning Zig::GlobalObject cell is being destroyed; from here on there is no global/VM.
     void globalObjectDestroyed();
@@ -154,6 +160,7 @@ public:
     static ScriptExecutionContext* getMainThreadScriptExecutionContext();
 
 private:
+    std::unique_ptr<Bun::NodeInspectorHeapRequests> m_nodeInspectorHeapRequests;
     std::atomic<bool> m_isTerminating { false };
     RefPtr<Bun::SharedEnvStore> m_sharedEnvStore;
     JSC::VM* m_vm = nullptr;
