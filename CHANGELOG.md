@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## openclaw-ci-f8ce0690-webkit-562a6f7c
+
+- Qualification build: backport [upstream WebKit `236cd93d6`](https://github.com/oven-sh/WebKit/commit/236cd93d6bdf76eca889bc898a80bc3e0dc64222) to construct microtask call-cache entries in zeroed storage. Thanks to Jarred Sumner and Dylan Conway. OpenClaw UI qualification and attribution to the Usage payload retention failure remain pending.
+
 ## openclaw-ci-f8ce0690-webkit-34c56b8c
 
 - Support asynchronous `node:inspector` heap collection after JavaScript becomes idle, with session cancellation and teardown cleanup.
