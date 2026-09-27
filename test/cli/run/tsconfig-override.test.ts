@@ -104,9 +104,7 @@ describe("bun run --tsconfig-override", () => {
 
     expect(stdout).toContain("42");
 
-    if (!stderr.includes("Internal error: directory mismatch")) {
-      expect(stderr).toBe("");
-    }
+    expect(stderr).toBe("");
     expect(exitCode).toBe(0);
   });
 
