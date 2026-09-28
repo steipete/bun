@@ -32,6 +32,43 @@ JSC_DEFINE_HOST_FUNCTION(functionIsStringOneByteRepresentation, (JSGlobalObject 
     return JSValue::encode(jsBoolean(asString(argument)->is8Bit()));
 }
 
+static JSObject* createHeapSizeStatistics(JSGlobalObject* globalObject)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    if (vm.heap.size() == 0)
+        vm.heap.collectNow(Sync, CollectionScope::Full);
+
+    JSObject* object = constructEmptyObject(globalObject);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    Bun::putDirectNamed(vm, object, "heapSize"_s, jsNumber(vm.heap.size()));
+    Bun::putDirectNamed(vm, object, "heapCapacity"_s, jsNumber(vm.heap.capacity()));
+    return object;
+}
+
+JSC_DEFINE_HOST_FUNCTION(functionGetHeapStatistics, (JSGlobalObject * globalObject, CallFrame*))
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSObject* object = createHeapSizeStatistics(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    Bun::putDirectNamed(vm, object, "extraMemorySize"_s, jsNumber(vm.heap.extraMemorySize()));
+    Bun::putDirectNamed(vm, object, "globalObjectCount"_s, jsNumber(vm.heap.globalObjectCount()));
+    return JSValue::encode(object);
+}
+
+JSC_DEFINE_HOST_FUNCTION(functionGetHeapSpaceStatistics, (JSGlobalObject * globalObject, CallFrame*))
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSObject* object = createHeapSizeStatistics(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(object);
+}
+
 static GCProfilerObserver& ensureGCProfilerObserver(JSGlobalObject* globalObject)
 {
     auto* global = defaultGlobalObject(globalObject);
@@ -99,6 +136,8 @@ JSC::JSObject* createNodeV8Binding(JSC::JSGlobalObject* globalObject)
     auto& vm = JSC::getVM(globalObject);
     JSC::JSObject* object = JSC::constructEmptyObject(vm, globalObject->nullPrototypeObjectStructure());
     object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "isStringOneByteRepresentation"_s), 1, functionIsStringOneByteRepresentation, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);
+    object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "getHeapStatistics"_s), 0, functionGetHeapStatistics, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);
+    object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "getHeapSpaceStatistics"_s), 0, functionGetHeapSpaceStatistics, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);
     object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "startGCProfiler"_s), 0, functionStartGCProfiler, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);
     object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "stopGCProfiler"_s), 1, functionStopGCProfiler, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);
     object->putDirectNativeFunction(vm, globalObject, JSC::Identifier::fromString(vm, "discardGCProfiler"_s), 1, functionDiscardGCProfiler, ImplementationVisibility::Public, JSC::NoIntrinsic, 0);

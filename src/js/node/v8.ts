@@ -5,10 +5,14 @@ const { hideFromStack, throwNotImplemented } = require("internal/shared");
 const { validateString, validateOneOf } = require("internal/validators");
 const { isDataView, isAnyArrayBuffer } = require("node:util/types");
 const jsc: typeof import("bun:jsc") = require("bun:jsc");
-const { isStringOneByteRepresentation, startGCProfiler, stopGCProfiler, discardGCProfiler } = $cpp(
-  "NodeV8.cpp",
-  "Bun::createNodeV8Binding",
-);
+const {
+  isStringOneByteRepresentation,
+  getHeapStatistics: getHeapStatisticsNative,
+  getHeapSpaceStatistics: getHeapSpaceStatisticsNative,
+  startGCProfiler,
+  stopGCProfiler,
+  discardGCProfiler,
+} = $cpp("NodeV8.cpp", "Bun::createNodeV8Binding");
 
 const DateNow = Date.now;
 const FunctionPrototypeCall = Function.prototype.call;
@@ -169,7 +173,7 @@ function totalmem() {
 }
 
 function getHeapStatistics() {
-  const stats = jsc.heapStats();
+  const stats = getHeapStatisticsNative();
   const memory = jsc.memoryUsage();
 
   // These numbers need to be plausible, even if incorrect
@@ -218,7 +222,7 @@ const kHeapSpaces = [
   "trusted_large_object_space",
 ];
 function getHeapSpaceStatistics() {
-  const stats = jsc.heapStats();
+  const stats = getHeapSpaceStatisticsNative();
   const spaces = [];
   for (let i = 0; i < kHeapSpaces.length; i++) {
     const space_name = kHeapSpaces[i];
