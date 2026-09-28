@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## openclaw-ci-515c9f7d-webkit-440fe0f8
+
+- Avoid unused diagnostic census work in `node:v8` heap-statistics APIs while retaining their live JavaScriptCore measurements and existing return formulas. Experimental CI qualification build; OpenClaw suite and memory-regression verification remain pending.
+
 ## openclaw-ci-9ebee125-webkit-440fe0f8
 
 - Point POSIX `NODE` and `npm_node_execpath` at the selected shim executable, including private fallback directories.
