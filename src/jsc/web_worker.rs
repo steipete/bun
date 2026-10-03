@@ -65,7 +65,7 @@ fn eval_source_has_module_syntax(source_bytes: &[u8]) -> bool {
     let define = bun_js_parser::Define::default();
     let options = bun_js_parser::ParserOptions::init(
         bun_js_parser::options::JSX::Pragma::default(),
-        bun_js_parser::options::Loader::Tsx,
+        bun_ast::Loader::Tsx,
     );
     let mut parse_log = bun_ast::Log::default();
     let Ok(parser) = bun_js_parser::Parser::init(options, &mut parse_log, &source, &define, &arena)
