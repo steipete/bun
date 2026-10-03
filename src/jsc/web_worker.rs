@@ -293,12 +293,11 @@ impl WebWorker {
         unsafe { bun_core::ffi::slice(self.argv_ptr, self.argv_len) }
     }
 
-    /// `None` when
-    /// `inherit_exec_argv` (the worker inherits the parent's execArgv),
-    /// otherwise `Some(slice)` (possibly empty) borrowed from C++ WorkerOptions.
+    /// Node workers retain a CLI argument snapshot even when inherited. Web
+    /// workers return `None` for inherited arguments; other slices borrow C++ WorkerOptions.
     #[inline]
     pub fn exec_argv(&self) -> Option<&[WTFStringImpl]> {
-        if self.inherit_exec_argv {
+        if self.inherit_exec_argv && !self.is_node_worker {
             return None;
         }
         // SAFETY: see `argv()`.
@@ -334,8 +333,11 @@ impl WebWorker {
         argv_ptr: *const WTFStringImpl,
         argv_len: usize,
         inherit_exec_argv: bool,
+        inherit_preloads: bool,
         exec_argv_ptr: *const WTFStringImpl,
         exec_argv_len: usize,
+        effective_exec_argv_ptr: *const WTFStringImpl,
+        effective_exec_argv_len: usize,
         preload_modules_ptr: *const BunString,
         preload_modules_len: usize,
         exec_argv_preload_modules_ptr: *const BunString,
@@ -407,7 +409,7 @@ impl WebWorker {
             worker_preload_require_start,
             worker_preload_require_count,
             worker_eval_mode,
-        ) = if inherit_exec_argv {
+        ) = if inherit_preloads {
             (
                 parent_ref.worker_preloads.clone(),
                 parent_ref.worker_eval_preloads.clone(),
@@ -465,14 +467,14 @@ impl WebWorker {
         }
         let store_fd = parent_ref.transpiler.resolver.store_fd;
         let mut transform_options = (*parent_ref.transpiler.options.transform_options).clone();
-        if !inherit_exec_argv {
+        if !inherit_preloads {
             let hooks = runtime_hooks().expect("RuntimeHooks not installed");
             // SAFETY: caller passed valid (ptr,len) borrowed from C++ WorkerOptions;
             // the hook only reads the slice.
             let parsed = unsafe {
                 (hooks.parse_worker_exec_argv_flags)(bun_core::ffi::slice(
-                    exec_argv_ptr,
-                    exec_argv_len,
+                    effective_exec_argv_ptr,
+                    effective_exec_argv_len,
                 ))
             };
             if let Some(flags) = parsed {
