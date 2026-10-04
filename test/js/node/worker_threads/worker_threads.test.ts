@@ -536,12 +536,15 @@ describe("execArgv preloads", () => {
   });
 
   test("keeps exit code zero when a preload error is handled", async () => {
-    const preload = `data:text/javascript,${encodeURIComponent(`
-      import { parentPort } from "node:worker_threads";
-      process.on("uncaughtException", error => parentPort.postMessage("handled:" + error.message));
-      throw new Error("handled preload failure");
-    `)}`;
-    expect(await runPreloadFailureProbe(preload)).toEqual({
+    // data: module evaluation has a separate upstream issue: oven-sh/bun#28483.
+    using dir = tempDir("worker-handled-preload", {
+      "preload.mjs": `
+        import { parentPort } from "node:worker_threads";
+        process.on("uncaughtException", error => parentPort.postMessage("handled:" + error.message));
+        throw new Error("handled preload failure");
+      `,
+    });
+    expect(await runPreloadFailureProbe(join(String(dir), "preload.mjs"))).toEqual({
       stdout: '{"events":[["message","handled:handled preload failure"]],"code":0}\n',
       stderr: "",
       exitCode: 0,
